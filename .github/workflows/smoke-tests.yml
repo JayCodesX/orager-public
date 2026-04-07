@@ -136,7 +136,7 @@ jobs:
 
       # ── Layer 1: persist the agents DB across runs via Actions cache ─────────
       - name: Restore agents DB cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: ~/.orager/agents
           key: agents-db-${{ github.run_id }}
@@ -149,7 +149,7 @@ jobs:
 
       - name: Save agents DB cache
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: ~/.orager/agents
           key: agents-db-${{ github.run_id }}
