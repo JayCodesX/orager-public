@@ -45,4 +45,5 @@ export function getToolByName(name: string): ToolExecutor | undefined {
 
 export { makeAgentTool, buildAgentsSystemPrompt } from "./agent.js";
 export { resolveUiResponse, renderUiTool } from "./render-ui.js";
+export { createAgentTool, shouldIncludeCreateAgentTool, CREATE_AGENT_TOOL_NAME } from "./create-agent.js";
 export { bashTool, readFileTool, writeFileTool, strReplaceTool, editFileTool, editFilesTool, listDirTool, globTool, grepTool, webFetchTool, webSearchTool, deleteFileTool, moveFileTool, createDirTool, finishTool, notebookReadTool, notebookEditTool, toolAliases, BROWSER_TOOLS, BROWSER_DEV_TOOLS, DEV_SERVER_TOOLS };

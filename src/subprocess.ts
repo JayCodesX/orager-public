@@ -445,6 +445,15 @@ export async function startSubprocessServer(): Promise<void> {
     let resultText = "";
     let costUsd = 0;
 
+    // Inject create_agent tool if the agent has permission
+    let extraTools: import("./types.js").ToolExecutor[] | undefined;
+    if (schedule.ownerType === "agent") {
+      const { shouldIncludeCreateAgentTool, createAgentTool } = await import("./tools/create-agent.js");
+      if (shouldIncludeCreateAgentTool(schedule.ownerId)) {
+        extraTools = [createAgentTool];
+      }
+    }
+
     try {
       await runAgentLoop({
         prompt,
@@ -456,6 +465,7 @@ export async function startSubprocessServer(): Promise<void> {
         cwd: process.env["HOME"] || "/tmp",
         dangerouslySkipPermissions: true,
         verbose: false,
+        extraTools,
         onEmit: (event) => {
           if (event.type === "assistant" && event.message?.content) {
             for (const block of event.message.content) {
@@ -506,6 +516,15 @@ export async function startSubprocessServer(): Promise<void> {
     const identityBlock = buildIdentityBlock(event.agentId);
     const wakePrompt = (identityBlock ? identityBlock + "\n\n" : "") + buildWakePrompt(event);
 
+    // Inject create_agent tool if the agent has permission
+    let wakeExtraTools: import("./types.js").ToolExecutor[] | undefined;
+    {
+      const { shouldIncludeCreateAgentTool: shouldInclude, createAgentTool: caTool } = await import("./tools/create-agent.js");
+      if (shouldInclude(event.agentId)) {
+        wakeExtraTools = [caTool];
+      }
+    }
+
     let resultText = "";
 
     try {
@@ -519,6 +538,7 @@ export async function startSubprocessServer(): Promise<void> {
         cwd: process.env["HOME"] || "/tmp",
         dangerouslySkipPermissions: true,
         verbose: false,
+        extraTools: wakeExtraTools,
         onEmit: (ev) => {
           if (ev.type === "assistant" && ev.message?.content) {
             for (const block of ev.message.content) {
