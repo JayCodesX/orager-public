@@ -1,0 +1,2672 @@
+import type {
+  AgentLoopOptions,
+  AssistantMessage,
+  EmitResultEvent,
+  Message,
+  OpenRouterUsage,
+  SystemMessage,
+  ToolCall,
+  ToolMetric,
+  TurnCallOverrides,
+  TurnContext,
+  UserMessage,
+} from "./types.js";
+import { applyProfileAsync } from "./profiles.js";
+import { loadProjectInstructions } from "./project-instructions.js";
+import { loadProjectCommands, resolveCommandPrompt, buildCommandsSystemPrompt } from "./project-commands.js";
+import { connectAllMcpServers } from "./mcp-client.js";
+import type { McpClientHandle } from "./mcp-client.js";
+import { makeTodoTools } from "./tools/todo.js";
+import { makeRememberTool } from "./tools/remember.js";
+import { makeWriteMemoryTool, makeReadMemoryTool, loadAutoMemory } from "./tools/auto-memory.js";
+import { loadMemoryStoreAny, saveMemoryStoreAny, addMemoryEntry, pruneExpired, renderMemoryBlock, renderRetrievedBlock, retrieveEntries, retrieveEntriesWithEmbeddings, memoryKeyFromCwd, buildMemoryKeyFromRepo, shouldUseFtsRetrieval, withMemoryLock } from "./memory.js";
+import { isSqliteMemoryEnabled, searchMemoryFtsMulti, loadMasterContext, addMemoryEntrySqlite, getMemoryEntryCount, getEntriesForDistillation, deleteMemoryEntriesByIds, retrieveEntriesANNSqlite, upsertProjectStructureSqlite } from "./memory-sqlite.js";
+import { fireHooks } from "./hooks.js";
+import type { HookConfig, HookPayload } from "./hooks.js";
+import { loadEffectiveSettings, mergeSettings, loadClaudeDesktopMcpServers } from "./settings.js";
+import { exitPlanModeTool, PLAN_MODE_TOOL_NAME } from "./tools/plan.js";
+// path is used in loop-executor.ts (extracted in Sprint 6)
+import { loadSession, saveSession, newSessionId, acquireSessionLock, saveSessionCheckpoint, loadLatestCheckpointByContextId } from "./session.js";
+import { writeRecoveryEntry, clearRecoveryEntry } from "./session-recovery.js";
+import { callWithRetry } from "./retry.js";
+// shouldUseDirect used in loop-preflight.ts (Sprint 6)
+import { getOpenRouterProvider } from "./providers/index.js";
+// isOllamaRunning, resolveOllamaBaseUrl, toOllamaTag, isModelPulled used in loop-preflight.ts (Sprint 6)
+import { getLiveModelPricing } from "./openrouter-model-meta.js";
+// fetchLiveModelMeta, isLiveModelMetaCacheWarm, liveModelSupportsTools, liveModelSupportsVision used in loop-preflight.ts (Sprint 6)
+import { recordProviderSuccess } from "./provider-health.js";
+import { loadSkillsFromDirs, buildSkillsSystemPrompt, buildSkillTools } from "./skills.js";
+import { retrieveSkills, buildSkillsPromptSection, updateSkillOutcomes } from "./skillbank.js";
+import { localEmbed } from "./local-embeddings.js";
+import { processInput, detectModalitiesFromBlocks } from "./input-processor.js";
+import { ALL_TOOLS, finishTool, BROWSER_TOOLS, makeAgentTool, buildAgentsSystemPrompt } from "./tools/index.js";
+import { getAgentsDb, loadAllAgents, loadAgentsForTask } from "./agents/registry.js";
+import { recordAgentScore } from "./agents/score.js";
+import { makeGenerateAgentTool } from "./agents/generate.js";
+import { FINISH_TOOL_NAME } from "./tools/finish.js";
+// promptApproval is used in loop-executor.ts (extracted in Sprint 6)
+import { getAgentCircuitBreaker } from "./circuit-breaker.js";
+import { log } from "./logger.js";
+// auditApproval, logToolCall are used in loop-executor.ts (extracted in Sprint 6)
+import { truncateContent } from "./truncate.js";
+// checkDeprecatedModel, getModelCapabilities used in loop-preflight.ts (Sprint 6)
+import { withSpan, spanSetAttributes } from "./telemetry.js";
+import { getCachedQueryEmbedding, setCachedQueryEmbedding } from "./embedding-cache.js";
+import { RateLimitTracker, isNearRateLimit, rateLimitSummary, getRateLimitState } from "./rate-limit-tracker.js";
+import { gatherContext, formatContext } from "./context-injector.js";
+import { writeProjectStructureDoc, formatProjectMap } from "./project-index.js"; // formatProjectMap used for skillbank text
+import { makeStuckMessage } from "./prompt-variation.js";
+import type { CacheEntry } from "./loop-helpers.js";
+// fetchModelContextLengths, isModelContextCacheWarm used in loop-preflight.ts (Sprint 6)
+import {
+  postWebhook,
+  estimateTokens,
+  getContextWindow,
+  MAX_SESSION_MESSAGES,
+  summarizeSession,
+  validateSummary,
+  runConcurrent,
+  MAX_PARALLEL_TOOLS,
+  evaluateTurnModelRules,
+  MEMORY_HEADER_MASTER,
+  MEMORY_HEADER_RETRIEVED,
+  MEMORY_HEADER_AUTO,
+  MEMORY_HEADER_PRIOR_SESSION,
+  MEMORY_UPDATE_INSTRUCTION,
+  parseMemoryUpdates,
+  DISTILL_ENTRY_THRESHOLD,
+  DISTILL_BATCH_SIZE,
+  distillMemoryEntries,
+  MEMORY_DYNAMIC_BUDGET_FRACTION,
+  MEMORY_LAYER1_MASTER_MAX_CHARS,
+  MEMORY_LAYER2_RETRIEVED_MAX_CHARS,
+  MEMORY_LAYER3_CHECKPOINT_MAX_CHARS,
+  MEMORY_HEADER_WIKI,
+} from "./loop-helpers.js";
+import { recordTokens, recordSession } from "./metrics.js";
+// recordToolCall is used in loop-executor.ts (extracted in Sprint 6)
+import { executeOne as _executeOneImpl, type ToolExecCtx } from "./loop-executor.js";
+import { runPreflight } from "./loop-preflight.js";
+import { isShutdownRequested } from "./shutdown.js";
+
+// ── Cost anomaly detection ────────────────────────────────────────────────────
+//
+// Fires a warning when a single turn's actual cost exceeds COST_ANOMALY_MULTIPLIER × rolling average.
+// The multiplier defaults to 2.0 but is overridable via ORAGER_COST_ANOMALY_MULTIPLIER.
+
+export const COST_ANOMALY_MULTIPLIER = parseFloat(
+  process.env["ORAGER_COST_ANOMALY_MULTIPLIER"] ?? "2.0",
+);
+
+// ── Agent loop ────────────────────────────────────────────────────────────────
+
+/**
+ * Compute the effective per-tool timeout given the run budget and per-tool overrides.
+ *
+ * Exported as a pure, deterministic function for unit testing. Callers may
+ * pass the elapsed time either directly (`elapsedMs`) or as a start timestamp
+ * pair (`startMs` + optional `nowMs`). When both are provided, `elapsedMs`
+ * takes precedence.
+ *
+ * The `_effectiveToolTimeout` closure inside `runAgentLoop` delegates to this.
+ *
+ * @param toolName     - The tool being executed.
+ * @param toolTimeouts - Per-tool explicit timeout map from AgentLoopOptions.
+ * @param timeoutSec   - Run-level timeout from AgentLoopOptions (0 = unlimited).
+ * @param elapsedMs    - Milliseconds elapsed since the loop started (preferred).
+ * @param startMs      - Loop start timestamp; used only when elapsedMs is omitted.
+ * @param nowMs        - Current timestamp (default: Date.now()); used with startMs.
+ */
+export function computeToolBudgetTimeout(params: {
+  toolName: string;
+  toolTimeouts?: Record<string, number>;
+  timeoutSec?: number;
+  elapsedMs?: number;
+  startMs?: number;
+  nowMs?: number;
+}): number | undefined {
+  const { toolName, toolTimeouts, timeoutSec, nowMs } = params;
+  const elapsedMs =
+    params.elapsedMs ??
+    (params.startMs !== undefined
+      ? (nowMs ?? Date.now()) - params.startMs
+      : 0);
+  const explicit = toolTimeouts?.[toolName];
+  if (timeoutSec && timeoutSec > 0) {
+    const remainingMs = timeoutSec * 1000 - elapsedMs;
+    if (remainingMs <= 0) return 1; // budget exhausted — let abort signal fire
+    const budgetCap = Math.min(
+      Math.max(Math.floor(remainingMs * 0.8), 5_000),
+      5 * 60_000, // never longer than 5 min per tool from budget
+    );
+    return explicit != null ? Math.min(explicit, budgetCap) : budgetCap;
+  }
+  return explicit;
+}
+
+/**
+ * Extract an embedded IPv4 from IPv4-mapped/compatible IPv6 addresses.
+ * Handles compressed (::ffff:), expanded (0:0:0:0:0:ffff:), and SIIT (::ffff:0:) prefixes
+ * in both dotted-decimal and hex-normalized forms.
+ */
+function extractMappedIPv4Webhook(ipv6Lower: string): string | null {
+  let n = ipv6Lower
+    .replace(/^0:0:0:0:0:ffff:0:/i, "::ffff:0:")
+    .replace(/^0:0:0:0:0:ffff:/i, "::ffff:")
+    .replace(/^0:0:0:0:0:0:/i, "::");
+  n = n.replace(/^::ffff:0:/i, "::ffff:");
+  const dotted = n.match(/^::(?:ffff:)?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+  if (dotted) return dotted[1];
+  const hex = n.match(/^::(?:ffff:)?([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (hex) {
+    const hi = parseInt(hex[1], 16);
+    const lo = parseInt(hex[2], 16);
+    if (hi <= 0xffff && lo <= 0xffff) {
+      return `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+    }
+  }
+  return null;
+}
+
+function isPrivateIPv4(ip: string): boolean {
+  return (
+    /^127\./.test(ip) || /^10\./.test(ip) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(ip) ||
+    /^192\.168\./.test(ip) ||
+    /^169\.254\./.test(ip) ||
+    /^0\./.test(ip) ||
+    /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(ip) ||
+    /^2(2[4-9]|3\d)\./.test(ip) || /^240\./.test(ip)
+  );
+}
+
+/** Check whether an IP string falls in a private/reserved range. */
+export function isPrivateIp(ip: string): boolean {
+  if (ip === "::1") return true;
+  if (isPrivateIPv4(ip)) return true;
+
+  // IPv6-native private ranges
+  const lower = ip.toLowerCase();
+  if (/^fe[89ab][0-9a-f]:/i.test(lower)) return true; // link-local
+  if (/^f[cd]/i.test(lower)) return true;              // ULA (fc00::/7)
+  if (/^ff[0-9a-f]{2}:/i.test(lower)) return true;    // multicast
+
+  // IPv4-mapped/compatible IPv6
+  const mapped = extractMappedIPv4Webhook(lower);
+  if (mapped) return isPrivateIPv4(mapped);
+
+  return false;
+}
+
+/**
+ * SSRF guard: rejects loopback/private IPs and non-http(s) schemes.
+ * Resolves DNS to prevent rebinding attacks where a hostname resolves to a
+ * public IP during validation but to a private IP during actual fetch.
+ */
+export async function isWebhookUrlSafe(raw: string | undefined): Promise<boolean> {
+  if (!raw) return false;
+  let u: URL;
+  try { u = new URL(raw); } catch { return false; }
+  if (u.protocol !== "https:" && u.protocol !== "http:") return false;
+  const h = u.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+
+  // Quick reject obvious private hostnames
+  if (h === "localhost") return false;
+  if (isPrivateIp(h)) return false;
+
+  // Resolve DNS to catch rebinding attacks
+  try {
+    const { promises: dns } = await import("node:dns");
+    const { address } = await dns.lookup(h);
+    if (isPrivateIp(address)) return false;
+  } catch {
+    // DNS resolution failed — reject to be safe
+    return false;
+  }
+  return true;
+}
+
+export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
+  // Subprocess transport: delegate to child process over JSON-RPC 2.0 stdio.
+  if (opts.subprocess?.enabled) {
+    const { runAgentLoopSubprocess } = await import("./subprocess.js");
+    return runAgentLoopSubprocess(opts);
+  }
+
+  const {
+    prompt,
+    model: _modelOpt,
+    addDirs,
+    maxTurns,
+    cwd,
+    verbose: _verbose,
+    onEmit: _rawOnEmit,
+    onLog,
+  } = opts;
+  // Declared as `let` so vision routing can swap it to opts.visionModel when
+  // the primary model does not support image inputs.
+  let model = _modelOpt;
+  // Effective prompt content — may be augmented by the input processor when
+  // opts.attachments are provided. Declared here so vision routing (below) can
+  // read it before the input processor block runs later in the function.
+  let _effectivePromptContent: import("./types.js").UserMessageContentBlock[] | undefined = opts.promptContent;
+  let _inputModalities = new Set<string>(["text"]);
+
+  // Track whether a result event has been emitted so the finally block knows
+  // whether it needs to emit one (e.g. when the loop is aborted mid-execution).
+  let _resultEmitted = false;
+  const onEmit = (event: Parameters<typeof _rawOnEmit>[0]) => {
+    if (event.type === "result") _resultEmitted = true;
+    _rawOnEmit(event);
+  };
+
+  // Prefer per-agent key over global key so one agent's 429 can't starve others.
+  const apiKey = opts.agentApiKey?.trim() || opts.apiKey || "";
+
+  const maxRetries = opts.maxRetries ?? 3;
+  const forceResume = opts.forceResume ?? false;
+  // Token-pressure trigger: fire when prompt_tokens exceed 70% of context window.
+  // Set to 0 to disable. Uses actual prompt_tokens from the previous API response
+  // (more accurate than local estimation) so the first turn falls back to estimateTokens.
+  const summarizeAt = Math.max(0, Math.min(1, opts.summarizeAt ?? 0.70));
+  const summarizeModel = opts.summarizeModel ?? model;
+  // Keep the last 4 assistant turns intact when summarizing so recent context is preserved.
+  const summarizeKeepRecentTurns = opts.summarizeKeepRecentTurns ?? 4;
+  // Turn-count trigger: fire every 6 turns regardless of token pressure.
+  // Whichever trigger fires first wins. Set to 0 to disable.
+  const summarizeTurnInterval = opts.summarizeTurnInterval ?? 6;
+  const toolErrorBudgetHardStop = opts.toolErrorBudgetHardStop ?? false;
+
+  // ── Profile expansion ─────────────────────────────────────────────────────
+  // Expand named profile (e.g. "code-review") into AgentLoopOptions defaults
+  // before merging settings. Caller opts always override profile defaults, so
+  // this expansion only fills fields the caller hasn't set explicitly.
+  if (opts.profile) {
+    opts = await applyProfileAsync(opts.profile, opts);
+  }
+
+  // ── Load and merge settings file ─────────────────────────────────────────
+  const fileSettings = await loadEffectiveSettings(opts.settingsFile);
+  const effectiveOpts = mergeSettings(opts, fileSettings);
+  // Hoisted hook options — shared by all fireHooks / runHook call sites.
+  const _hookOpts = { timeoutMs: effectiveOpts.hookTimeoutMs, errorMode: effectiveOpts.hookErrorMode };
+
+  // ── Required environment variable check ───────────────────────────────────
+  // Fail fast before any API calls when env vars required by tools are absent.
+  if (opts.requiredEnvVars && opts.requiredEnvVars.length > 0) {
+    const missing = opts.requiredEnvVars.filter(
+      (v) => typeof v === "string" && v.trim().length > 0 && !process.env[v.trim()],
+    );
+    if (missing.length > 0) {
+      onLog?.("stderr", `[orager] missing required environment variables: ${missing.join(", ")}\n`);
+      onEmit({
+        type: "result",
+        subtype: "error",
+        result: `Missing required environment variables: ${missing.join(", ")}`,
+        session_id: opts.sessionId ?? "",
+        finish_reason: null,
+        usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0 },
+        total_cost_usd: 0,
+      });
+      return;
+    }
+  }
+
+  // Record loop start time so per-tool budget deadlines can be derived from
+  // remaining time (timeoutSec * 1000 - elapsed). Used in tool execution below.
+  const _loopStartMs = Date.now();
+
+  // ── Run-level timeout ──────────────────────────────────────────────────────
+  // Compose opts.abortSignal with a timeout signal derived from opts.timeoutSec.
+  // The resulting signal aborts at whichever fires first.
+  const _effectiveAbortSignal: AbortSignal | undefined = (() => {
+    const signals: AbortSignal[] = [];
+    if (opts.abortSignal) signals.push(opts.abortSignal);
+    if (opts.timeoutSec && opts.timeoutSec > 0) {
+      signals.push(AbortSignal.timeout(opts.timeoutSec * 1000));
+    }
+    if (signals.length === 0) return undefined;
+    if (signals.length === 1) return signals[0];
+    return AbortSignal.any(signals);
+  })();
+
+  /**
+   * Derive the effective timeout for a tool call.
+   * - If an explicit entry exists in opts.toolTimeouts, honour it but cap it
+   *   at the remaining run budget so tools never outlive the loop.
+   * - If timeoutSec > 0 and no explicit timeout is set, use 80% of the
+   *   remaining budget (min 5 s, max 5 min) so the loop always has headroom
+   *   for post-tool hooks and summarization.
+   * - Returns undefined when there is no effective limit.
+   */
+  function _effectiveToolTimeout(toolName: string): number | undefined {
+    return computeToolBudgetTimeout({
+      toolName,
+      toolTimeouts: opts.toolTimeouts,
+      timeoutSec: opts.timeoutSec,
+      elapsedMs: Date.now() - _loopStartMs,
+    });
+  }
+
+  // Per-agent persistent circuit breaker — keyed by sessionId so the circuit
+  // state survives across daemon re-requests for the same session. When the
+  // daemon retries the same agent, a prior failure streak is still counted.
+  // For new sessions (opts.sessionId null) a throwaway key is used; the eviction
+  // timer in circuit-breaker.ts cleans up idle entries after 1 hour.
+  const _cbKey = opts.sessionId ?? newSessionId();
+  const circuitBreaker = getAgentCircuitBreaker(_cbKey);
+
+  // Per-agent rate-limit tracker — isolates rate-limit state per agent so a
+  // 429 on one agent does not suppress requests from other concurrent agents.
+  // The process-global singleton (used by /metrics) is still updated in openrouter.ts.
+  const rlTracker = new RateLimitTracker();
+
+  // Fetch live model metadata (context windows + pricing + capabilities) from OpenRouter.
+  // ── Pre-flight: model metadata, deprecation, capability, vision swap, Ollama ─
+  // Extracted to loop-preflight.ts (Sprint 6 decomposition).
+  // runPreflight may swap `model` (vision model routing) and returns the Ollama URL.
+  let _ollamaBaseUrl: string | undefined;
+  ({ model, ollamaBaseUrl: _ollamaBaseUrl } = await runPreflight(
+    model,
+    apiKey,
+    opts,
+    opts.sessionId ?? "(new)",
+    _effectivePromptContent ?? opts.promptContent,
+    onLog,
+  ));
+  const contextWindow = getContextWindow(model);
+
+  // Per-invocation tool result cache (never persisted). Capped at 200 entries
+  // (FIFO eviction) to prevent unbounded memory growth on long read-heavy runs.
+  const MAX_TOOL_CACHE_ENTRIES = 200;
+  const toolResultCache = new Map<string, CacheEntry>();
+  function setCached(key: string, value: CacheEntry): void {
+    if (toolResultCache.size >= MAX_TOOL_CACHE_ENTRIES) {
+      const oldest = toolResultCache.keys().next().value;
+      if (oldest !== undefined) toolResultCache.delete(oldest);
+    }
+    toolResultCache.set(key, value);
+  }
+
+  // Tool error budget tracking: consecutive error count per tool name
+  const consecutiveToolErrors = new Map<string, number>(); // toolName → consecutive error count
+
+  // ── Spawn-cycle fast-exit ─────────────────────────────────────────────────
+  // Check before any I/O (session lock, DB, etc.) — no point acquiring a lock
+  // or loading session data for a run we are about to reject.
+  const _earlyParentIds = opts._parentSessionIds ?? [];
+  if (opts.sessionId && _earlyParentIds.includes(opts.sessionId)) {
+    onLog?.("stderr", `[orager] ERROR: spawn cycle detected — session '${opts.sessionId}' is already an ancestor. Aborting sub-agent.\n`);
+    return;
+  }
+
+  // ── Rolling cost quota check ──────────────────────────────────────────────
+  if (opts.costQuota) {
+    const { checkCostQuota } = await import("./cost-quota.js");
+    const quotaErr = await checkCostQuota(opts.costQuota);
+    if (quotaErr) {
+      onLog?.("stderr", `[orager] ${quotaErr}\n`);
+      onEmit({
+        type: "result",
+        subtype: "error_max_cost",
+        result: quotaErr,
+        session_id: opts.sessionId ?? "unknown",
+        finish_reason: "cost_quota_exceeded",
+        usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0 },
+        total_cost_usd: 0,
+        turnCount: 0,
+      });
+      return;
+    }
+  }
+
+  // ── Safety warning ────────────────────────────────────────────────────────
+  if (opts.dangerouslySkipPermissions) {
+    onLog?.(
+      "stderr",
+      "[orager] WARNING: --dangerously-skip-permissions is active — all tool approvals are bypassed\n",
+    );
+  }
+
+  // ── 1. Load or create session ─────────────────────────────────────────────
+  let sessionId: string;
+  let messages: Message[] = [];
+  let createdAt: string = new Date().toISOString();
+  let isResume = false;
+  let releaseLock: (() => Promise<void>) | null = null;
+  // Cumulative cost from prior runs of this session (loaded on resume).
+  // Initialised to 0 for new sessions; updated when we load an existing session.
+  let priorCumulativeCostUsd = 0;
+
+  let pendingApproval: {
+    toolCallId: string;
+    toolName: string;
+    input: Record<string, unknown>;
+    assistantMessage: AssistantMessage;
+    toolCalls: ToolCall[];
+    questionedAt?: string;
+  } | null = null;
+
+  if (opts.sessionId) {
+    try {
+      releaseLock = await acquireSessionLock(opts.sessionId, {
+        timeoutMs: opts.sessionLockTimeoutMs,
+      });
+    } catch (lockErr) {
+      const msg = lockErr instanceof Error ? lockErr.message : String(lockErr);
+      onLog?.("stderr", `[orager] could not acquire session lock: ${msg}\n`);
+      // If the lock cannot be acquired (concurrent run on same session), emit
+      // a proper error result so the caller gets a meaningful message.
+      if (msg.includes("Cannot start concurrent runs")) {
+        onEmit({
+          type: "result",
+          subtype: "error",
+          result: msg,
+          session_id: opts.sessionId,
+          finish_reason: null,
+          usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0 },
+          total_cost_usd: 0,
+        });
+        return;
+      }
+      // Other lock errors (e.g. filesystem error): log and proceed without lock
+    }
+    const existing = await loadSession(opts.sessionId);
+    if (existing && (forceResume || existing.cwd === cwd)) {
+      sessionId = existing.sessionId;
+      messages = existing.messages;
+      createdAt = existing.createdAt;
+      isResume = true;
+      pendingApproval = existing.pendingApproval ?? null;
+      // Load cumulative cost so cost limits apply to the full session total
+      // (not just the current run). Missing in older sessions → default 0.
+      priorCumulativeCostUsd = existing.cumulativeCostUsd ?? 0;
+      if (forceResume && existing.cwd !== cwd) {
+        onLog?.(
+          "stderr",
+          `[orager] warning: resuming session ${opts.sessionId} from different cwd (was ${existing.cwd}, now ${cwd})\n`,
+        );
+      }
+    } else {
+      if (existing) {
+        onLog?.(
+          "stderr",
+          `[orager] warning: session ${opts.sessionId} has a different cwd (${existing.cwd}), starting fresh (use --force-resume to override)\n`,
+        );
+      } else {
+        onLog?.(
+          "stderr",
+          `[orager] warning: session ${opts.sessionId} not found, starting fresh\n`,
+        );
+        onEmit({
+          type: "warn",
+          subtype: "session_lost",
+          message: `session ${opts.sessionId} not found, starting fresh`,
+          session_id: opts.sessionId,
+        });
+      }
+      sessionId = newSessionId();
+    }
+  } else {
+    sessionId = newSessionId();
+  }
+
+  // ── 2. Build system prompt + tool list ────────────────────────────────────
+  let systemPrompt =
+    "You are an autonomous software engineering agent. Work through the user's task completely using the available tools. Think step by step. When you are done, provide a concise summary of what you accomplished.";
+
+  const skills = await loadSkillsFromDirs(addDirs);
+  const skillsSection = buildSkillsSystemPrompt(skills);
+  if (skillsSection) {
+    systemPrompt += "\n\n" + skillsSection;
+  }
+
+  if (opts.appendSystemPrompt?.trim()) {
+    systemPrompt += "\n\n" + opts.appendSystemPrompt.trim();
+  }
+
+  // ── Project instructions (CLAUDE.md / ORAGER.md) ──────────────────────────
+  if (opts.readProjectInstructions !== false) {
+    const projectInstructions = await loadProjectInstructions(cwd);
+    if (projectInstructions) {
+      const MAX_PROJECT_INSTRUCTIONS_CHARS = 50_000; // ~12k tokens; prevents runaway CLAUDE.md files
+      const capped = projectInstructions.length > MAX_PROJECT_INSTRUCTIONS_CHARS
+        ? projectInstructions.slice(0, MAX_PROJECT_INSTRUCTIONS_CHARS) + "\n\n[... project instructions truncated at 50,000 chars ...]"
+        : projectInstructions;
+      if (projectInstructions.length > MAX_PROJECT_INSTRUCTIONS_CHARS) {
+        onLog?.("stderr", `[orager] WARNING: project instructions file exceeds ${MAX_PROJECT_INSTRUCTIONS_CHARS} chars (${projectInstructions.length} chars) — truncated\n`);
+      }
+      systemPrompt += "\n\n--- Project instructions (CLAUDE.md / ORAGER.md) ---\n" + capped;
+    }
+  }
+
+  // ── Project commands (.claude/commands/) ──────────────────────────────────
+  const projectCommands = await loadProjectCommands(cwd);
+  if (projectCommands.size > 0) {
+    const commandsSection = buildCommandsSystemPrompt(projectCommands);
+    if (commandsSection) systemPrompt += "\n\n" + commandsSection;
+  }
+
+  // ── Auto-load agent catalog (top-level runs only) ────────────────────────
+  // Load seeds + user/project files + DB into opts.agents at depth 0.
+  // Sub-agents (depth > 0) never auto-load — they receive agents: undefined
+  // from their parent to prevent recursive spawning.
+  //
+  // When the catalog is large, loadAgentsForTask uses semantic search to
+  // retrieve only the most relevant DB agents for this specific prompt.
+  // For small catalogs (< 10 DB agents), all agents are loaded as-is.
+  const isTopLevel = (opts._spawnDepth ?? 0) === 0;
+  if (isTopLevel && !opts.agents) {
+    try {
+      const taskText = typeof opts.prompt === "string"
+        ? opts.prompt
+        : Array.isArray(opts.prompt)
+          ? (opts.prompt as Array<{ text?: string }>).map((b) => b.text ?? "").join(" ")
+          : "";
+      opts = {
+        ...opts,
+        agents: taskText
+          ? await loadAgentsForTask(taskText, cwd)
+          : await loadAllAgents(cwd),
+      };
+    } catch {
+      // Non-fatal — registry unavailable, continue without catalog agents
+    }
+  }
+
+  // ── Available sub-agents ──────────────────────────────────────────────────
+  // Injected before the frozen boundary so it's part of the stable cached prefix.
+  if (opts.agents && Object.keys(opts.agents).length > 0) {
+    const agentsSection = buildAgentsSystemPrompt(opts.agents);
+    if (agentsSection) systemPrompt += "\n\n" + agentsSection;
+  }
+
+  // Phase 4: inject autonomous memory update instruction into the frozen section
+  // when memory is enabled.  Placed here (before the frozen boundary) so it is
+  // part of the cached stable prefix and does not change between sessions.
+  // opts.memory !== false is the same computation used by memoryEnabled below.
+  if (opts.memory !== false) {
+    systemPrompt += MEMORY_UPDATE_INSTRUCTION;
+  }
+
+  // ── Layer 1: Master context — injected into the frozen prefix ────────────────
+  // Master context is loaded here, BEFORE the frozen boundary, so it becomes part
+  // of the stable cached prefix. It changes only via the set_master tool, not on
+  // every turn, making it safe and beneficial to cache alongside the base prompt.
+  // The effectiveMemoryKey is computed early here; the full memory setup below
+  // (Layer 2 retrieved entries, Layer 3 checkpoint) uses the same value.
+  const _memoryEnabled_frozen = opts.memory !== false;
+  const _resolvedDefault_frozen = opts.repoUrl
+    ? buildMemoryKeyFromRepo(opts.agentId ?? "default", opts.repoUrl)
+    : memoryKeyFromCwd(cwd);
+  const _effectiveMemoryKeys_frozen: string[] = Array.isArray(opts.memoryKey)
+    ? opts.memoryKey.map((k) => k.trim()).filter(Boolean)
+    : (typeof opts.memoryKey === "string" && opts.memoryKey.trim())
+      ? [opts.memoryKey.trim()]
+      : [_resolvedDefault_frozen];
+  if (_effectiveMemoryKeys_frozen.length === 0) _effectiveMemoryKeys_frozen.push(_resolvedDefault_frozen);
+  const _effectiveMemoryKey_frozen = _effectiveMemoryKeys_frozen[0]!;
+
+  if (_memoryEnabled_frozen && isSqliteMemoryEnabled()) {
+    try {
+      const masterCtxRaw = await loadMasterContext(_effectiveMemoryKey_frozen);
+      if (masterCtxRaw) {
+        // Enforce Layer 1 budget — master context is capped at MEMORY_LAYER1_MASTER_MAX_CHARS.
+        // Truncation here is a safety net; upsertMasterContext already enforces the same cap.
+        const masterCtx = masterCtxRaw.length > MEMORY_LAYER1_MASTER_MAX_CHARS
+          ? masterCtxRaw.slice(0, MEMORY_LAYER1_MASTER_MAX_CHARS)
+          : masterCtxRaw;
+        systemPrompt += "\n\n" + MEMORY_HEADER_MASTER + "\n\n" + masterCtx;
+        log.info("master_context_loaded", {
+          sessionId,
+          contextId: _effectiveMemoryKey_frozen,
+          chars: masterCtx.length,
+          tokenEstimate: Math.round(masterCtx.length / 4),
+        });
+      }
+    } catch { /* non-fatal */ }
+  }
+
+  // Phase 3: record the frozen boundary — everything assembled above this line
+  // is stable across sessions with the same configuration (base instructions,
+  // skills, project CLAUDE.md, commands, and master context).
+  // Dynamic memory blocks appended below are excluded from the frozen section.
+  const frozenSystemPromptLength = systemPrompt.length;
+
+  // ── SkillBank injection (ADR-0006) ────────────────────────────────────────
+  // Retrieve top-K learned skills by cosine similarity to the run prompt and
+  // inject them as a "## Learned Skills" block. Non-fatal — errors are swallowed.
+  // Embedding priority: local (Transformers.js, free) → OpenRouter API (fallback).
+  const _injectedSkillIds: string[] = [];
+  if (opts.skillbank?.enabled !== false) {
+    try {
+      const embModel = opts.memoryEmbeddingModel ?? "local";
+      let skillQueryVec = getCachedQueryEmbedding(embModel, prompt);
+      if (!skillQueryVec) {
+        // Try local embeddings first (free, fast, no API key needed)
+        skillQueryVec = await localEmbed(prompt);
+        // Fall back to OpenRouter API
+        if (!skillQueryVec && opts.memoryEmbeddingModel && apiKey) {
+          const vecs = await getOpenRouterProvider().callEmbeddings!(apiKey, opts.memoryEmbeddingModel, [prompt]);
+          skillQueryVec = vecs[0] ?? [];
+        }
+        if (skillQueryVec && skillQueryVec.length > 0) {
+          setCachedQueryEmbedding(embModel, prompt, skillQueryVec);
+        }
+      }
+      if (skillQueryVec && skillQueryVec.length > 0) {
+        const learnedSkills = await retrieveSkills(skillQueryVec, opts.skillbank, prompt);
+        if (learnedSkills.length > 0) {
+          const skillsSection = buildSkillsPromptSection(learnedSkills);
+          if (skillsSection) {
+            systemPrompt += "\n\n" + skillsSection;
+            for (const sk of learnedSkills) _injectedSkillIds.push(sk.id);
+          }
+        }
+      }
+    } catch { /* non-fatal — SkillBank failure must never abort a run */ }
+  }
+
+
+  // Validate extraTools names before merging
+  for (const tool of opts.extraTools ?? []) {
+    const name = tool.definition?.function?.name ?? "";
+    if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
+      onLog?.("stderr", `[orager] WARNING: extraTool name '${name}' contains invalid characters — tool names must be alphanumeric, underscore, or hyphen\n`);
+    }
+  }
+
+  // Merge: built-in tools + skill tools + finish tool (opt-in) + browser tools (opt-in) + caller-supplied extra tools
+  let allTools = [
+    ...ALL_TOOLS,
+    ...buildSkillTools(
+      skills,
+      // H-04: Pass bash policy blocked commands to skill tools so they
+      // cannot bypass the blocklist by running commands via exec templates.
+      effectiveOpts.bashPolicy?.blockedCommands?.length
+        ? new Set(effectiveOpts.bashPolicy.blockedCommands.map((b: string) => b.toLowerCase()))
+        : undefined,
+    ),
+    ...(opts.useFinishTool ? [finishTool] : []),
+    ...(opts.enableBrowserTools ? BROWSER_TOOLS : []),
+    ...(opts.extraTools ?? []),
+  ];
+
+  // ── _allowedTools filter (sub-agents) ────────────────────────────────────
+  // When spawned as a sub-agent, opts._allowedTools restricts the tool set to
+  // the names listed in the AgentDefinition. The Agent tool is never passed
+  // through (sub-agents cannot spawn further sub-agents).
+  const _allowedToolNames = (opts as { _allowedTools?: string[] })._allowedTools;
+  if (_allowedToolNames && _allowedToolNames.length > 0) {
+    const allowed = new Set(_allowedToolNames.map((n) => n.toLowerCase()));
+    allTools = allTools.filter((t) =>
+      allowed.has((t.definition.function.name ?? "").toLowerCase())
+    );
+  }
+
+  // ── _disallowedTools filter (sub-agents) ─────────────────────────────────
+  // Applied after the allowlist — removes explicitly blocked tools from the
+  // AgentDefinition.disallowedTools denylist.
+  const _disallowedToolNames = (opts as { _disallowedTools?: string[] })._disallowedTools;
+  if (_disallowedToolNames && _disallowedToolNames.length > 0) {
+    const blocked = new Set(_disallowedToolNames.map((n) => n.toLowerCase()));
+    allTools = allTools.filter((t) =>
+      !blocked.has((t.definition.function.name ?? "").toLowerCase())
+    );
+  }
+
+  // ── Agent tool + generate_agent tool ─────────────────────────────────────
+  // Only at top-level (depth 0) or when the agents map was explicitly provided.
+  // Sub-agents never get these tools — they operate with a fixed tool set.
+  if (opts.agents && Object.keys(opts.agents).length > 0) {
+    // Agent: spawn from catalog (with dynamic generation fallback for unknowns)
+    allTools.push(makeAgentTool(opts.agents, opts));
+    // generate_agent: proactive synthesis + registration of new agent types
+    // Share the same mutable agents map so newly generated agents are immediately
+    // available to the Agent tool in the same session.
+    allTools.push(makeGenerateAgentTool(opts.agents, opts));
+  }
+
+  // ── Todo tools (session-scoped) ───────────────────────────────────────────
+  // Note: sessionId is set above in the session load/create block
+  allTools.push(...makeTodoTools(sessionId));
+
+  // ── Cross-session memory ───────────────────────────────────────────────────
+  // Reuse values computed above (before the frozen boundary) — master context
+  // was already loaded and appended to the cached prefix.
+  const memoryEnabled = _memoryEnabled_frozen;
+  // Layer 2 budget: cap retrieved entries at MEMORY_LAYER2_RETRIEVED_MAX_CHARS.
+  // When the caller supplies memoryMaxChars, honour it but never exceed the layer cap.
+  const memoryMaxChars = typeof opts.memoryMaxChars === "number" && opts.memoryMaxChars > 0
+    ? Math.min(opts.memoryMaxChars, MEMORY_LAYER2_RETRIEVED_MAX_CHARS)
+    : MEMORY_LAYER2_RETRIEVED_MAX_CHARS;
+  const effectiveMemoryKeys = _effectiveMemoryKeys_frozen;
+  // Primary key: write target + master context + checkpoints + distillation.
+  const effectiveMemoryKey = _effectiveMemoryKey_frozen;
+
+  if (memoryEnabled) {
+    // Load + prune the store, inject into system prompt, and register the tool
+    try {
+      const memStore = pruneExpired(await withSpan("memory.load", {
+        memoryKey: effectiveMemoryKey,
+        backend: isSqliteMemoryEnabled() ? "sqlite" : "file",
+      }, async () => loadMemoryStoreAny(effectiveMemoryKey)));
+      const threshold = typeof opts.memoryRetrievalThreshold === "number"
+        ? opts.memoryRetrievalThreshold
+        : 15;
+      const retrieval = opts.memoryRetrieval ?? "local";
+      let memBlock: string;
+      // Phase 7: track which retrieval path fired for observability logging.
+      let _retrievalPath: string;
+      let _retrievalCount = 0;
+      const _retrievalStartMs = Date.now();
+      if (retrieval === "embedding") {
+        try {
+          // Check in-memory cache before calling the embeddings API
+          const embModel = opts.memoryEmbeddingModel ?? "local";
+          let queryVec = getCachedQueryEmbedding(embModel, prompt);
+          if (!queryVec) {
+            // Try local embeddings first (free, fast)
+            queryVec = await localEmbed(prompt);
+            // Fall back to OpenRouter API
+            if (!queryVec && opts.memoryEmbeddingModel && apiKey) {
+              queryVec = await withSpan("memory.embed_query", {
+                model: opts.memoryEmbeddingModel,
+              }, async () => {
+                const vecs = await getOpenRouterProvider().callEmbeddings!(apiKey, opts.memoryEmbeddingModel!, [prompt]);
+                return vecs[0] ?? [];
+              });
+            }
+            if (queryVec && queryVec.length > 0) {
+              setCachedQueryEmbedding(embModel, prompt, queryVec);
+            }
+          }
+          const embEntries = await withSpan("memory.retrieve_embeddings", {
+            totalEntries: memStore.entries.length,
+            topK: 12,
+            path: "embedding",
+          }, async () => {
+            const qv = queryVec ?? [];
+            const ann = await retrieveEntriesANNSqlite(effectiveMemoryKey, qv, 12);
+            return ann ?? retrieveEntriesWithEmbeddings(memStore, qv, { topK: 12 });
+          });
+          memBlock = renderRetrievedBlock(embEntries, memoryMaxChars, "deterministic");
+          _retrievalPath = "embedding"; _retrievalCount = embEntries.length;
+        } catch {
+          // Fall back to Phase 1 on embedding API failure
+          memBlock = memStore.entries.length <= threshold
+            ? renderMemoryBlock(memStore, memoryMaxChars)
+            : renderRetrievedBlock(retrieveEntries(memStore, prompt, { topK: 12 }), memoryMaxChars, "deterministic");
+          _retrievalPath = "full_store_embedding_err"; _retrievalCount = memStore.entries.length;
+        }
+      } else if (shouldUseFtsRetrieval(opts.memoryRetrieval)) {
+        // SQLite + local retrieval: use FTS5 for efficient full-text search
+        // searchMemoryFtsMulti searches across all read-source namespaces in one query.
+        const ftsResults = await searchMemoryFtsMulti(effectiveMemoryKeys, prompt, 12);
+        // Deduplicate by id and render
+        const seen = new Set<string>();
+        const deduped = ftsResults.filter((e) => {
+          if (seen.has(e.id)) return false;
+          seen.add(e.id);
+          return true;
+        });
+        if (deduped.length > 0) {
+          memBlock = renderRetrievedBlock(deduped, memoryMaxChars, "deterministic");
+          _retrievalPath = "fts"; _retrievalCount = deduped.length;
+        } else {
+          // Phase 6A: FTS returned nothing — fall back to embedding-based retrieval.
+          // The memStore is already loaded above; retrieveEntriesWithEmbeddings scores
+          // entries that have a stored _embedding vector by cosine similarity.
+          try {
+            const embModel = opts.memoryEmbeddingModel ?? "local";
+            let queryVec = getCachedQueryEmbedding(embModel, prompt);
+            if (!queryVec) {
+              // Try local embeddings first (free, fast)
+              queryVec = await localEmbed(prompt);
+              // Fall back to OpenRouter API
+              if (!queryVec && opts.memoryEmbeddingModel && apiKey) {
+                queryVec = await withSpan("memory.embed_query_fts_fallback", {
+                  model: opts.memoryEmbeddingModel,
+                }, async () => {
+                  const vecs = await getOpenRouterProvider().callEmbeddings!(apiKey, opts.memoryEmbeddingModel!, [prompt]);
+                  return vecs[0] ?? [];
+                });
+              }
+              if (queryVec && queryVec.length > 0) {
+                setCachedQueryEmbedding(embModel, prompt, queryVec);
+              }
+            }
+            const embResults = queryVec && queryVec.length > 0
+              ? await withSpan("memory.retrieve_embeddings", {
+                  totalEntries: memStore.entries.length,
+                  topK: 12,
+                  path: "fts_embedding_fallback",
+                }, async () => {
+                  const ann = await retrieveEntriesANNSqlite(effectiveMemoryKey, queryVec!, 12);
+                  return ann ?? retrieveEntriesWithEmbeddings(memStore, queryVec!, { topK: 12 });
+                })
+              : [];
+            if (embResults.length > 0) {
+              onLog?.("stderr", `[orager] FTS miss — embedding fallback retrieved ${embResults.length} entries\n`);
+              memBlock = renderRetrievedBlock(embResults, memoryMaxChars, "deterministic");
+              _retrievalPath = "fts_embedding_fallback"; _retrievalCount = embResults.length;
+            } else {
+              memBlock = renderMemoryBlock(memStore, memoryMaxChars);
+              _retrievalPath = "full_store"; _retrievalCount = memStore.entries.length;
+            }
+          } catch {
+            // Non-fatal — fall through to full store render
+            memBlock = renderMemoryBlock(memStore, memoryMaxChars);
+            _retrievalPath = "full_store"; _retrievalCount = memStore.entries.length;
+          }
+        }
+      } else {
+        // Phase 1 path (existing logic from Phase 1)
+        const p1entries = memStore.entries.length <= threshold
+          ? memStore.entries
+          : retrieveEntries(memStore, prompt, { topK: 12 });
+        memBlock = memStore.entries.length <= threshold
+          ? renderMemoryBlock(memStore, memoryMaxChars)
+          : renderRetrievedBlock(p1entries, memoryMaxChars, "deterministic");
+        _retrievalPath = "local_scored"; _retrievalCount = p1entries.length;
+      }
+      if (memBlock) {
+        systemPrompt += "\n\n" + MEMORY_HEADER_RETRIEVED + "\n\n" + memBlock;
+      }
+      // Phase 7: structured log for retrieval path observability.
+      log.info("memory_retrieval", {
+        sessionId,
+        contextId: effectiveMemoryKey,
+        path: _retrievalPath,
+        count: _retrievalCount,
+        totalEntries: memStore.entries.length,
+        durationMs: Date.now() - _retrievalStartMs,
+      });
+    } catch { /* non-fatal — memory load failure must never abort a run */ }
+    allTools.push(makeRememberTool(
+      effectiveMemoryKey,
+      memoryMaxChars,
+      opts.memoryRetrieval === "embedding" && opts.memoryEmbeddingModel
+        ? { apiKey, model: opts.memoryEmbeddingModel }
+        : null,
+      effectiveMemoryKey, // contextId — same namespace as primary memoryKey
+      effectiveMemoryKeys.length > 1 ? effectiveMemoryKeys : undefined,
+    ));
+  }
+
+  // ── Knowledge Wiki injection ─────────────────────────────────────────────
+  // Inject relevant wiki topic pages between retrieved memory and auto-memory.
+  // Non-fatal: failure must never abort a run.
+  try {
+    const { getWikiBlock } = await import("./knowledge-wiki.js");
+    const wikiBlock = await getWikiBlock(prompt);
+    if (wikiBlock) {
+      systemPrompt += "\n\n" + MEMORY_HEADER_WIKI + "\n\n" + wikiBlock;
+    }
+  } catch { /* non-fatal — wiki may not be initialized */ }
+
+  // ── Auto-memory (CLAUDE.md / MEMORY.md writer) ────────────────────────────
+  if (opts.autoMemory) {
+    try {
+      const autoMem = await loadAutoMemory(cwd);
+      // Inject existing memory into the system prompt so the agent can
+      // reference past notes without an explicit read_memory call.
+      const autoMemParts: string[] = [];
+      if (autoMem.project.trim()) {
+        autoMemParts.push("## Project memory (CLAUDE.md)\n\n" + autoMem.project.trim());
+      }
+      if (autoMem.global.trim()) {
+        autoMemParts.push("## Global memory (~/.orager/MEMORY.md)\n\n" + autoMem.global.trim());
+      }
+      if (autoMemParts.length > 0) {
+        systemPrompt += "\n\n" + MEMORY_HEADER_AUTO + "\n\n" + autoMemParts.join("\n\n");
+      }
+    } catch { /* non-fatal — memory read failure must never abort a run */ }
+    allTools.push(makeWriteMemoryTool(cwd));
+    allTools.push(makeReadMemoryTool(cwd));
+  }
+
+  // ── Phase 5: Cold-start — inject prior session checkpoint ─────────────────
+  // On a fresh (non-resume) session, load the most recent synthesised checkpoint
+  // for this context namespace and inject its summary. This gives all model
+  // providers the same "warm start" benefit that Claude gets from CLAUDE.md
+  // training — the agent picks up factual continuity without re-reading history.
+  // Non-fatal: failure must never abort a run.
+  if (memoryEnabled && isSqliteMemoryEnabled() && !isResume) {
+    try {
+      const priorCp = await loadLatestCheckpointByContextId(effectiveMemoryKey);
+      if (priorCp?.summary) {
+        // Enforce Layer 3 budget — checkpoint summary is capped at MEMORY_LAYER3_CHECKPOINT_MAX_CHARS.
+        const cpSummary = priorCp.summary.length > MEMORY_LAYER3_CHECKPOINT_MAX_CHARS
+          ? priorCp.summary.slice(0, MEMORY_LAYER3_CHECKPOINT_MAX_CHARS)
+          : priorCp.summary;
+        systemPrompt += "\n\n" + MEMORY_HEADER_PRIOR_SESSION + "\n\n" + cpSummary;
+        log.info("prior_checkpoint_injected", {
+          sessionId,
+          contextId: effectiveMemoryKey,
+          priorThreadId: priorCp.threadId,
+          priorTurn: priorCp.lastTurn,
+          chars: cpSummary.length,
+        });
+      }
+    } catch { /* non-fatal */ }
+  }
+
+  // ── Phase 7: Dynamic memory token budget ──────────────────────────────────
+  // Cap the combined dynamic section (master context + retrieved memory +
+  // auto-memory + prior session) to MEMORY_DYNAMIC_BUDGET_FRACTION of the
+  // context window. Prevents the memory injection from crowding out the
+  // conversation history on small-context models or large memory stores.
+  // Uses a 4 chars/token heuristic — coarse but allocation-free.
+  if (memoryEnabled) {
+    const dynamicChars = systemPrompt.length - frozenSystemPromptLength;
+    const budgetChars = Math.floor(contextWindow * MEMORY_DYNAMIC_BUDGET_FRACTION * 4);
+    if (dynamicChars > budgetChars && budgetChars > 0) {
+      systemPrompt =
+        systemPrompt.slice(0, frozenSystemPromptLength + budgetChars) +
+        "\n\n[Memory section truncated — exceeded context budget]";
+      onLog?.(
+        "stderr",
+        `[orager] memory budget enforced: dynamic section capped at ${budgetChars} chars (~${Math.round(budgetChars / 4)} tokens)\n`,
+      );
+      log.info("memory_budget_enforced", {
+        sessionId,
+        contextId: effectiveMemoryKey,
+        dynamicCharsBefore: dynamicChars,
+        budgetChars,
+        contextWindow,
+        fraction: MEMORY_DYNAMIC_BUDGET_FRACTION,
+      });
+    }
+  }
+
+  // Warn about duplicate tool names (first definition wins via find())
+  const seenToolNames = new Set<string>();
+  for (const tool of allTools) {
+    const name = tool.definition.function.name;
+    if (seenToolNames.has(name)) {
+      onLog?.("stderr", `[orager] warning: duplicate tool name '${name}' — first definition takes precedence\n`);
+    } else {
+      seenToolNames.add(name);
+    }
+  }
+
+  // ── Spawn-agent tool (inline closure — avoids circular import) ────────────
+  const maxSpawnDepth = opts.maxSpawnDepth ?? 2;
+  const currentSpawnDepth = opts._spawnDepth ?? 0;
+  // Session spawn counter: shared ref so all nested calls increment the same counter
+  const sessionSpawnCounter = opts._sessionSpawnCount ?? { value: 0 };
+  const maxSpawnsPerSession = opts.maxSpawnsPerSession ?? 50;
+
+  if (maxSpawnDepth > 0 && currentSpawnDepth < maxSpawnDepth) {
+    allTools.push({
+      definition: {
+        type: "function",
+        readonly: false,
+        function: {
+          name: "spawn_agent",
+          description:
+            "Spawn a sub-agent to complete a self-contained task. " +
+            "You can call this tool multiple times in a single turn to run agents IN PARALLEL — " +
+            "all spawn_agent calls in the same turn execute concurrently. " +
+            "Use parallel agents for independent subtasks: researching while editing, running tests while writing docs, etc. " +
+            "Each agent has access to the same tools and working directory. " +
+            `Maximum nesting depth: ${maxSpawnDepth - currentSpawnDepth} more level(s). ` +
+            `Session spawn budget remaining: ${maxSpawnsPerSession > 0 ? Math.max(0, maxSpawnsPerSession - sessionSpawnCounter.value) : "unlimited"}.`,
+          parameters: {
+            type: "object",
+            properties: {
+              task: {
+                type: "string",
+                description: "Full description of the task for the sub-agent to complete",
+              },
+              model: {
+                type: "string",
+                description: `Model to use for the sub-agent (default: ${model})`,
+              },
+              max_turns: {
+                type: "number",
+                description: "Maximum turns for the sub-agent (default: 20)",
+              },
+              agent_id: {
+                type: "string",
+                description: "Optional label for this agent (used in logs to identify parallel runs, e.g. 'researcher', 'tester')",
+              },
+            },
+            required: ["task"],
+          },
+        },
+      },
+      async execute(input: Record<string, unknown>): Promise<{ toolCallId: string; content: string; isError: boolean }> {
+        if (typeof input["task"] !== "string" || !input["task"]) {
+          return { toolCallId: "", content: "task must be a non-empty string", isError: true };
+        }
+
+        // ── Session spawn budget guard ──────────────────────────────────────
+        if (maxSpawnsPerSession > 0 && sessionSpawnCounter.value >= maxSpawnsPerSession) {
+          return {
+            toolCallId: "",
+            content: `Session spawn limit (${maxSpawnsPerSession}) reached. Cannot spawn another agent.`,
+            isError: true,
+          };
+        }
+        sessionSpawnCounter.value += 1;
+
+        const subTask = input["task"] as string;
+        const subModel = typeof input["model"] === "string" ? input["model"] : model;
+        const subMaxTurns = typeof input["max_turns"] === "number" ? (input["max_turns"] as number) : 20;
+        const agentId = typeof input["agent_id"] === "string" ? input["agent_id"] : null;
+        const agentLabel = agentId ? ` [${agentId}]` : "";
+        const spawnKey = agentId ?? "spawn_agent";
+
+        let subResult = "";
+        let subError: string | null = null;
+        let subTurns = 0;
+        let subCostUsd = 0;
+        let subFilesChanged: string[] | undefined;
+        const spawnStartMs = Date.now();
+
+        onLog?.("stderr", `[orager] spawning sub-agent${agentLabel} (depth ${currentSpawnDepth + 1}/${maxSpawnDepth}, session spawns: ${sessionSpawnCounter.value}/${maxSpawnsPerSession > 0 ? maxSpawnsPerSession : "∞"}): ${subTask.slice(0, 100)}\n`);
+
+        await runAgentLoop({
+          ...opts,
+          prompt: subTask,
+          model: subModel,
+          maxTurns: subMaxTurns,
+          sessionId: null, // fresh session for each sub-agent
+          trackFileChanges: true,
+          _spawnDepth: currentSpawnDepth + 1,
+          _sessionSpawnCount: sessionSpawnCounter,
+          maxSpawnsPerSession,
+          _parentSessionIds: [..._earlyParentIds, ...(sessionId ? [sessionId] : [])],
+          onEmit: (event) => {
+            if (event.type === "result") {
+              subResult = event.result ?? "";
+              subTurns = event.turnCount ?? 0;
+              subCostUsd = event.total_cost_usd ?? 0;
+              subFilesChanged = (event as { filesChanged?: string[] }).filesChanged;
+              if (event.subtype !== "success") {
+                subError = `Sub-agent ended with subtype '${event.subtype}': ${event.result}`;
+              }
+            }
+            // Forward sub-agent events to parent
+            opts.onEmit(event);
+          },
+          onLog: opts.onLog,
+        });
+
+        // ── Record score ────────────────────────────────────────────────────
+        const spawnDurationMs = Date.now() - spawnStartMs;
+        getAgentsDb().then((db) => {
+          recordAgentScore(db, {
+            agentId: spawnKey,
+            sessionId: sessionId ?? null,
+            success: !subError,
+            turns: subTurns,
+            costUsd: subCostUsd,
+            durationMs: spawnDurationMs,
+          });
+        }).catch((err) => {
+          onLog?.("stderr", `[orager] recordAgentScore failed: ${err instanceof Error ? err.message : err}\n`);
+        });
+
+        if (subError) {
+          return { toolCallId: "", content: subError, isError: true };
+        }
+
+        // Merge sub-agent filesChanged into the parent's tracking Set
+        if (subFilesChanged && opts.trackFileChanges) {
+          for (const f of subFilesChanged) filesChanged.add(f);
+        }
+
+        // Build a structured summary so the parent model can reason about cost/files
+        const costStr = subCostUsd > 0 ? ` (cost: $${subCostUsd.toFixed(4)})` : "";
+        const filesStr = subFilesChanged && subFilesChanged.length > 0
+          ? `\nFiles changed: ${subFilesChanged.join(", ")}`
+          : "";
+        return {
+          toolCallId: "",
+          content: `Sub-agent${agentLabel} completed in ${subTurns} turn(s)${costStr}:\n${subResult || "(no result text)"}${filesStr}`,
+          isError: false,
+        };
+      },
+    });
+  }
+
+  // ── Plan mode notice ─────────────────────────────────────────────────────
+  // Injected when opts.planMode is true so the model knows it is restricted
+  // to read-only tools until it explicitly calls exit_plan_mode.
+  if (opts.planMode) {
+    systemPrompt +=
+      "\n\n**PLAN MODE ACTIVE**: You are currently in plan mode. " +
+      "Only read-only exploration tools are available right now. " +
+      "Use them to analyse the codebase and form a complete plan. " +
+      "When your plan is fully worked out, call `exit_plan_mode` with a brief " +
+      "`plan_summary` to switch to full execution mode where all tools become available.";
+  }
+
+  systemPrompt += "\n\nWorking directory: " + cwd;
+
+  // ── MCP client tools ──────────────────────────────────────────────────────
+  const mcpHandles: McpClientHandle[] = [];
+  // Auto-discover from ~/.claude/claude_desktop_config.json when not explicitly set
+  const resolvedMcpServers =
+    effectiveOpts.mcpServers && Object.keys(effectiveOpts.mcpServers).length > 0
+      ? effectiveOpts.mcpServers
+      : (effectiveOpts.mcpServers === undefined ? await loadClaudeDesktopMcpServers() : {});
+  if (Object.keys(resolvedMcpServers).length > 0) {
+    const handles = await connectAllMcpServers(resolvedMcpServers, (msg) => onLog?.("stderr", msg));
+    for (const h of handles) {
+      allTools.push(...h.tools);
+      mcpHandles.push(h);
+    }
+
+    // Enforce requireMcpServers: fail fast if a critical server didn't connect
+    if (effectiveOpts.requireMcpServers && effectiveOpts.requireMcpServers.length > 0) {
+      const connectedPrefixes = new Set(
+        mcpHandles.flatMap((h) => h.tools.map((t) => t.definition.function.name.split("__")[1] ?? "")),
+      );
+      const missing = effectiveOpts.requireMcpServers.filter((name) => !connectedPrefixes.has(name));
+      if (missing.length > 0) {
+        const errResult = {
+          type: "result" as const,
+          subtype: "error" as const,
+          result: `Required MCP server(s) failed to connect: ${missing.join(", ")}`,
+          session_id: sessionId,
+          finish_reason: null,
+          total_cost_usd: 0,
+          usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0 },
+          turnCount: 0,
+        };
+        onEmit(errResult);
+        return;
+      }
+    }
+  }
+
+  // ── Plan mode ─────────────────────────────────────────────────────────────
+  let inPlanMode = opts.planMode ?? false;
+
+  // ── 3. Emit init ──────────────────────────────────────────────────────────
+  onEmit({ type: "system", subtype: "init", model, session_id: sessionId });
+  log.info("loop_start", { sessionId, model, isResume });
+
+  // ── Recovery manifest — register this session as in-flight ──────────────
+  writeRecoveryEntry({
+    sessionId,
+    model,
+    cwd,
+    turn: 0,
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    pid: process.pid,
+    prompt: opts.prompt?.slice(0, 200),
+  }).catch(() => { /* non-fatal */ });
+  // Structured startup log for log aggregators (Datadog, CloudWatch, etc.).
+  // Gated on ORAGER_JSON_LOGS=1 so it doesn't clutter interactive TTY output.
+  // Written to stderr so it never contaminates the JSON event stream on stdout.
+  if (process.env["ORAGER_JSON_LOGS"] === "1") {
+    onLog?.("stderr", JSON.stringify({
+      event: "orager.start",
+      version: process.env["ORAGER_VERSION"] ?? "unknown",
+      model,
+      sessionId,
+      isResume,
+      ts: new Date().toISOString(),
+    }) + "\n");
+  }
+
+  // ── SessionStart hook ─────────────────────────────────────────────────────
+  if (effectiveOpts.hooks?.SessionStart) {
+    const _sr = await fireHooks("SessionStart", effectiveOpts.hooks.SessionStart, { event: "SessionStart", sessionId, ts: new Date().toISOString() }, _hookOpts, (msg) => onLog?.("stderr", msg));
+    if (!_sr.ok && effectiveOpts.hookErrorMode === "fail") {
+      throw new Error(`SessionStart hook failed: ${_sr.error}`);
+    }
+  }
+
+  // ── 4. Assemble initial messages ──────────────────────────────────────────
+
+  // ── Context injection ─────────────────────────────────────────────────────
+  let injectedContextPrefix = "";
+  if (opts.injectContext && !isResume) {
+    try {
+      const ctx = await gatherContext(cwd);
+      injectedContextPrefix = await formatContext(ctx, cwd, prompt) + "\n\n";
+      // Phase 2: persist structure doc for future runs (fire-and-forget, non-fatal)
+      if (ctx.projectMap && !ctx.projectMap.fromCache) {
+        writeProjectStructureDoc(ctx.projectMap, cwd).catch((err) => {
+          onLog?.("stderr", `[orager] writeProjectStructureDoc failed: ${err instanceof Error ? err.message : err}\n`);
+        });
+        // Skillbank integration: store project structure as a permanent memory fact
+        // so recall tools can retrieve it and it survives project-index cache invalidation.
+        if (_memoryEnabled_frozen && isSqliteMemoryEnabled()) {
+          formatProjectMap(ctx.projectMap, cwd).then(structureText => {
+            upsertProjectStructureSqlite(_effectiveMemoryKey_frozen, `Project structure for ${cwd}:\n${structureText}`).catch((err) => {
+              onLog?.("stderr", `[orager] upsertProjectStructureSqlite failed: ${err instanceof Error ? err.message : err}\n`);
+            });
+          }).catch((err) => {
+            onLog?.("stderr", `[orager] formatProjectMap failed: ${err instanceof Error ? err.message : err}\n`);
+          });
+        }
+      }
+    } catch { /* non-fatal */ }
+  }
+
+  // Resolve /command-name prompt shortcuts
+  let resolvedPrompt = prompt;
+  if (!isResume && !opts.promptContent) {
+    const resolved = resolveCommandPrompt(prompt, projectCommands);
+    if (resolved !== null) {
+      resolvedPrompt = resolved;
+      onLog?.("stderr", `[orager] resolved command prompt (${prompt.split(" ")[0]})\n`);
+    }
+  }
+
+  // ── Process file attachments (input-processor) ────────────────────────────
+  // If attachments are provided, encode them into content blocks and merge with
+  // any pre-built promptContent. The resulting modalities set is stored for use
+  // by the confidence router's modality_mismatch signal.
+  if (!isResume && opts.attachments && opts.attachments.length > 0) {
+    try {
+      const processed = await processInput(resolvedPrompt, opts.attachments);
+      _inputModalities = processed.modalities as Set<string>;
+      // Merge with any caller-provided content blocks
+      _effectivePromptContent = [
+        ...processed.contentBlocks,
+        ...(opts.promptContent ?? []),
+      ];
+      if (processed.hasImages) {
+        onLog?.("stderr", `[orager] ${processed.modalities.size > 1 ? [...processed.modalities].filter(m => m !== "text").join("+") + " " : ""}input detected — encoding ${opts.attachments.length} attachment(s)\n`);
+      }
+    } catch { /* non-fatal — proceed without attachments */ }
+  } else if (opts.promptContent) {
+    _inputModalities = detectModalitiesFromBlocks(opts.promptContent) as Set<string>;
+  }
+
+  const userMessage: UserMessage = _effectivePromptContent && _effectivePromptContent.length > 0
+    ? { role: "user", content: _effectivePromptContent }
+    : { role: "user", content: injectedContextPrefix + resolvedPrompt };
+
+  if (isResume) {
+    messages = [...messages, userMessage];
+  } else {
+    const systemMessage: SystemMessage = { role: "system", content: systemPrompt };
+    messages = [systemMessage, userMessage];
+  }
+
+  // ── 5. Agent loop ─────────────────────────────────────────────────────────
+  let turn = 0;
+  let cumulativeUsage: OpenRouterUsage = {
+    prompt_tokens: 0,
+    completion_tokens: 0,
+    total_tokens: 0,
+  };
+  let cumulativeCachedTokens = 0;
+  let cumulativeCacheWriteTokens = 0;
+  // Start from the session's prior cumulative cost so cost limits apply to the
+  // full session total rather than resetting to $0 on every resume.
+  let totalCostUsd = priorCumulativeCostUsd;
+  // Per-category cost accumulators — only populated when pricing is available.
+  let inputCostUsd = 0;
+  let outputCostUsd = 0;
+  /** Returns the cost breakdown if any pricing data was captured, else undefined. */
+  function costBreakdown(): { input_usd: number; output_usd: number } | undefined {
+    if (inputCostUsd === 0 && outputCostUsd === 0) return undefined;
+    return { input_usd: inputCostUsd, output_usd: outputCostUsd };
+  }
+  let lastResponseModel = model;
+  let lastFinishReason: string | null = null;
+  let lastAssistantText = "";
+
+  // Loop-detection state
+  let lastToolCallSig = "";
+  let identicalTurnStreak = 0;
+  let stuckAttempt = 0;
+  const maxIdenticalTurns = opts.maxIdenticalToolCallTurns ?? 5;
+  let loopAborted = false; // set true when stuck-detection forces a break
+
+  // JSON healing state — one healing attempt per run
+  let jsonHealingUsed = false;
+
+  // Closure variable for pending approval request (question mode).
+  // Set inside executeOne when approvalMode === "question" and approval is needed.
+  let pendingApprovalRequest: {
+    toolCallId: string;
+    toolName: string;
+    input: Record<string, unknown>;
+  } | null = null;
+
+  // Per-run tool metrics — keyed by tool name, accumulates across all turns
+  const toolMetrics = new Map<string, ToolMetric>();
+
+  // File change tracking
+  const filesChanged = new Set<string>();
+
+  // ── Tool execution context (shared across all executeOne calls in this run) ──
+  // Passed by reference so mutable sets/maps (filesChanged, toolMetrics, cache)
+  // are updated in-place from loop-executor.ts without needing closure capture.
+  const _toolExecCtx: ToolExecCtx = {
+    allTools,
+    opts,
+    effectiveOpts,
+    cwd,
+    sessionId,
+    filesChanged,
+    toolResultCache,
+    setCached,
+    toolMetrics,
+    _hookOpts,
+    _effectiveToolTimeout,
+    onLog,
+  };
+
+  // Helper: execute a single tool call. Delegates to loop-executor.ts.
+  // Captures _pendingApprovalRequest from the result into the loop-level variable.
+  async function executeOne(toolCall: ToolCall): Promise<{ id: string; content: string; isError: boolean; imageUrl?: string; _approvalPending?: true }> {
+    const result = await _executeOneImpl(toolCall, _toolExecCtx, inPlanMode);
+    if (result._pendingApprovalRequest) {
+      pendingApprovalRequest = result._pendingApprovalRequest;
+    }
+    return result;
+  }
+
+  const _sessionStartMs = Date.now();
+  // Stable prompt fingerprint: SHA-256(model + "\n" + prompt), first 16 hex chars.
+  // Distinct from sessionId so repeated prompts on different sessions share the same
+  // prompt_id in traces — enabling cross-session prompt performance analysis.
+  const _promptId = await (async () => {
+    try {
+      const { createHash } = await import("node:crypto");
+      return createHash("sha256").update(`${model}\n${prompt}`).digest("hex").slice(0, 16);
+    } catch {
+      return sessionId; // fallback: crypto unavailable
+    }
+  })();
+  await withSpan("agent_loop", { "orager.session_id": sessionId, "orager.model": model, "orager.prompt_id": _promptId }, async (rootSpan) => {
+  void rootSpan; // rootSpan available for attribute setting
+
+  const firedOnce = new Set<number>();
+
+  // ── emitResult helper ─────────────────────────────────────────────────────
+  // DRY wrapper: fires onEmit, records OTel session metrics, fires the webhook,
+  // MaxTurnsReached hook (when applicable), and the Stop hook for every terminal
+  // result event.
+  const emitResult = async (resultEvent: EmitResultEvent): Promise<void> => {
+    onEmit(resultEvent);
+    // ── Structured completion log (mirror of orager.start) ──────────────
+    if (process.env["ORAGER_JSON_LOGS"] === "1") {
+      onLog?.("stderr", JSON.stringify({
+        event: "orager.end",
+        sessionId,
+        model: lastResponseModel,
+        subtype: resultEvent.subtype,
+        turn,
+        totalCostUsd: resultEvent.total_cost_usd,
+        durationMs: Date.now() - _sessionStartMs,
+        ts: new Date().toISOString(),
+      }) + "\n");
+    }
+    // ── Rolling cost quota: record this run's cost ─────────────────────────
+    if (opts.costQuota && resultEvent.total_cost_usd > 0) {
+      const { recordCost } = await import("./cost-quota.js");
+      recordCost({
+        ts: Date.now(),
+        costUsd: resultEvent.total_cost_usd,
+        sessionId,
+        model: lastResponseModel,
+      }).catch(() => { /* non-fatal */ });
+    }
+    // ── SkillBank: record outcomes for injected skills (ADR-0006) ────────
+    if (_injectedSkillIds.length > 0) {
+      const skillSuccess = resultEvent.subtype === "success";
+      updateSkillOutcomes(_injectedSkillIds, skillSuccess).catch(() => { /* non-fatal */ });
+    }
+    // ── OTel metrics: session duration + turn count ──────────────────────
+    recordSession(Date.now() - _sessionStartMs, resultEvent.turnCount ?? turn, resultEvent.subtype);
+    if (await isWebhookUrlSafe(opts.webhookUrl)) {
+      const webhookErr = await postWebhook(opts.webhookUrl!, resultEvent, opts.webhookFormat, opts.webhookSecret);
+      if (webhookErr) {
+        onEmit({ type: "warn", message: `webhook_delivery_failed: ${webhookErr}` });
+      }
+    }
+    // MaxTurnsReached fires before Stop so listeners can distinguish the reason.
+    if (resultEvent.subtype === "error_max_turns" && effectiveOpts.hooks?.MaxTurnsReached) {
+      await fireHooks("MaxTurnsReached", effectiveOpts.hooks.MaxTurnsReached, {
+        event: "MaxTurnsReached",
+        sessionId,
+        model: lastResponseModel,
+        turn,
+        subtype: resultEvent.subtype,
+        totalCostUsd: resultEvent.total_cost_usd,
+        turnCount: resultEvent.turnCount,
+        ts: new Date().toISOString(),
+      } satisfies HookPayload, _hookOpts, (msg) => onLog?.("stderr", msg));
+    }
+    if (effectiveOpts.hooks?.Stop) {
+      await fireHooks("Stop", effectiveOpts.hooks.Stop, {
+        event: "Stop",
+        sessionId,
+        model: lastResponseModel,
+        turn,
+        subtype: resultEvent.subtype,
+        result: resultEvent.result,
+        totalCostUsd: resultEvent.total_cost_usd,
+        turnCount: resultEvent.turnCount,
+        ts: new Date().toISOString(),
+      } satisfies HookPayload, _hookOpts, (msg) => onLog?.("stderr", msg));
+    }
+  };
+
+  try {
+    // ── Pending approval resume ────────────────────────────────────────────────
+    // If this session has a pending approval (run ended with a question event),
+    // resolve it now using opts.approvalAnswer before starting the turn loop.
+    if (isResume && pendingApproval && opts.approvalAnswer) {
+      const approved = opts.approvalAnswer.choiceKey === "approve";
+
+      // Re-inject the assistant message that had tool calls
+      messages.push(pendingApproval.assistantMessage);
+
+      // Create synthetic tool results for all tool calls in that turn
+      for (const tc of pendingApproval.toolCalls) {
+        if (tc.id === pendingApproval.toolCallId) {
+          // This is the tool that needed approval
+          const result = approved
+            ? await executeOne(tc)
+            : { id: tc.id, content: `Tool '${tc.function.name}' was denied by the user.`, isError: true };
+          messages.push({ role: "tool" as const, tool_call_id: tc.id, content: result.content });
+        } else {
+          // Other tool calls in the same turn — execute normally
+          const result = await executeOne(tc);
+          messages.push({ role: "tool" as const, tool_call_id: tc.id, content: result.content });
+        }
+      }
+
+      // Clear pending approval from session
+      await saveSession({
+        sessionId,
+        model,
+        messages,
+        createdAt,
+        updatedAt: new Date().toISOString(),
+        turnCount: 0,
+        cwd,
+        pendingApproval: null,
+        cumulativeCostUsd: totalCostUsd,
+      }).catch((err: unknown) => {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        process.stderr.write(`[orager] WARNING: session save failed (approval-pending) for ${sessionId}: ${errMsg}\n`);
+        onEmit({ type: "warn", message: "session_save_failed_approval_pending: " + errMsg });
+      });
+
+      const elapsedMs = pendingApproval.questionedAt
+        ? Date.now() - new Date(pendingApproval.questionedAt).getTime()
+        : null;
+      const elapsedStr = elapsedMs !== null
+        ? ` (waited ${elapsedMs < 60_000 ? `${Math.round(elapsedMs / 1000)}s` : `${Math.round(elapsedMs / 60_000)}m`})`
+        : "";
+      onLog?.("stderr", `[orager] approval resolved (${approved ? "approved" : "denied"})${elapsedStr} — resuming run\n`);
+    }
+
+    // Rolling average for cost anomaly detection (P3-5)
+    // Track per-turn actual costs to compute a running average.
+    const _turnCosts: number[] = [];
+
+    // Summarization failure cooldown — after a failed summarization attempt,
+    // skip re-attempting for SUMMARIZE_COOLDOWN_TURNS turns to avoid hammering
+    // the API when the summarize model is unavailable or the context is malformed.
+    const SUMMARIZE_COOLDOWN_TURNS = 5;
+    let summarizeFailedAtTurn = -SUMMARIZE_COOLDOWN_TURNS - 1; // sentinel: never failed
+
+    // Phase 2: turn-count summarization trigger + checkpoint state
+    let turnsSinceLastSummary = 0;
+    // Last turn's prompt_tokens from API response — used for token-pressure check
+    // instead of the slow estimateTokens() call.
+    let lastTurnPromptTokens = 0;
+
+    // maxTurns <= 0 means unlimited
+    while (maxTurns <= 0 || turn < maxTurns) {
+      // ── Cancellation / graceful shutdown check ────────────────────────────
+      // isShutdownRequested() is set by the SIGINT/SIGTERM handler in index.ts.
+      // Breaking here lets the finally block run normally: session is saved,
+      // locks released, MCP handles closed.
+      if (isShutdownRequested()) {
+        onLog?.("stderr", "[orager] shutdown requested — stopping loop cleanly\n");
+        log.warn("loop_shutdown", { sessionId, turn });
+        break;
+      }
+      if (_effectiveAbortSignal?.aborted) {
+        onLog?.("stderr", "[orager] run cancelled via abort signal\n");
+        log.warn("loop_cancelled", { sessionId, turn });
+        await saveSession({
+          sessionId,
+          model: lastResponseModel,
+          messages,
+          createdAt,
+          updatedAt: new Date().toISOString(),
+          turnCount: turn,
+          cwd,
+          cumulativeCostUsd: totalCostUsd,
+        }).catch((err: unknown) => {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        process.stderr.write(`[orager] WARNING: session save failed (approval-answer) for ${sessionId}: ${errMsg}\n`);
+        onEmit({ type: "warn", message: "session_save_failed_approval_answer: " + errMsg });
+      });
+        {
+          const resultEvent = {
+            type: "result" as const,
+            subtype: "error_cancelled" as const,
+            result: "Run was cancelled",
+            session_id: sessionId,
+            finish_reason: null,
+            usage: {
+              input_tokens: cumulativeUsage.prompt_tokens,
+              output_tokens: cumulativeUsage.completion_tokens,
+              cache_read_input_tokens: cumulativeCachedTokens,
+              cache_write_tokens: cumulativeCacheWriteTokens,
+            },
+            total_cost_usd: totalCostUsd,
+          cost_breakdown: costBreakdown(),
+            turnCount: turn,
+            toolMetrics: Object.fromEntries(toolMetrics),
+            filesChanged: opts.trackFileChanges ? Array.from(filesChanged) : undefined,
+          };
+          await emitResult(resultEvent);
+        }
+        return;
+      }
+
+      // ── Per-turn dynamic overrides ────────────────────────────────────────
+      const turnCtx: TurnContext = {
+        turn,
+        model: lastResponseModel,
+        cumulativeTokens: {
+          prompt: cumulativeUsage.prompt_tokens,
+          completion: cumulativeUsage.completion_tokens,
+          total: cumulativeUsage.total_tokens,
+        },
+        cumulativeCostUsd: totalCostUsd,
+        messages,
+      };
+      const ruleModel = evaluateTurnModelRules(opts.turnModelRules, turnCtx, firedOnce);
+      const callbackOverrides = opts.onTurnStart?.(turnCtx) ?? {};
+      // onTurnStart overrides take priority over rules
+      const turnOverrides: TurnCallOverrides = {
+        ...( ruleModel ? { model: ruleModel } : {} ),
+        ...callbackOverrides,
+      };
+
+      // ── Rate limit warning ───────────────────────────────────────────────
+      // Use the per-agent tracker so one agent's 429 doesn't delay other agents.
+      // Fall back to the global singleton when the per-agent tracker has no data
+      // yet (e.g. very first turn before any response headers have been seen).
+      const _rlActive = rlTracker.getState() ? rlTracker : null;
+      if ((_rlActive ? _rlActive.isNearLimit() : isNearRateLimit())) {
+        const rlState = _rlActive ? _rlActive.getState() : getRateLimitState();
+        const resetAt = rlState?.resetRequestsAt ?? rlState?.resetTokensAt;
+        const waitMs = resetAt ? Math.max(0, resetAt.getTime() - Date.now()) : 0;
+        const summary = _rlActive ? _rlActive.summary() : rateLimitSummary();
+        if (waitMs > 0 && waitMs <= 60_000) {
+          onLog?.("stderr", `[orager] near rate limit — waiting ${Math.ceil(waitMs / 1000)}s for reset (${summary})\n`);
+          log.warn("rate_limit_wait", { sessionId, waitMs, summary });
+          await new Promise<void>((r) => setTimeout(r, waitMs));
+        } else {
+          onLog?.("stderr", `[orager] WARNING: approaching OpenRouter rate limit — ${summary}\n`);
+          log.warn("rate_limit_near", { sessionId, summary });
+        }
+      }
+
+      // ── Circuit breaker check ──────────────────────────────────────────────
+      if (circuitBreaker.isOpen()) {
+        const retryIn = Math.ceil(circuitBreaker.retryInMs / 1000);
+        onLog?.("stderr", `[orager] OpenRouter circuit breaker is OPEN — retry in ${retryIn}s\n`);
+        {
+          const resultEvent = {
+            type: "result" as const,
+            subtype: "error_circuit_open" as const,
+            result: `OpenRouter circuit breaker is open (${retryIn}s until next retry)`,
+            session_id: sessionId,
+            finish_reason: null,
+            usage: {
+              input_tokens: cumulativeUsage.prompt_tokens,
+              output_tokens: cumulativeUsage.completion_tokens,
+              cache_read_input_tokens: cumulativeCachedTokens,
+              cache_write_tokens: cumulativeCacheWriteTokens,
+            },
+            total_cost_usd: totalCostUsd,
+          cost_breakdown: costBreakdown(),
+            turnCount: turn,
+            toolMetrics: Object.fromEntries(toolMetrics),
+            filesChanged: opts.trackFileChanges ? Array.from(filesChanged) : undefined,
+          };
+          await emitResult(resultEvent);
+        }
+        return;
+      }
+
+      // Track whether any text_delta / thinking_delta events were emitted for
+      // this turn so the downstream assistant event can set streamed: true and
+      // consumers can skip re-rendering already-streamed text.
+      let turnWasStreamed = false;
+      // Apply :online suffix when web-search mode is requested and the model
+      // doesn't already carry a variant suffix (:online, :nitro, :thinking, etc.)
+      const _baseModel = turnOverrides.model ?? model;
+      const _effectiveModel =
+        opts.onlineSearch && !_baseModel.includes(":")
+          ? `${_baseModel}:online`
+          : _baseModel;
+
+      // Apply :online suffix to fallback models too, so web-search mode is
+      // consistent if OpenRouter routes to a fallback instead of the primary.
+      const _effectiveModels = opts.onlineSearch && opts.models && opts.models.length > 0
+        ? opts.models.map((m) => (m.includes(":") ? m : `${m}:online`))
+        : opts.models;
+
+
+      // ── PreLLMRequest hook ────────────────────────────────────────────────
+      if (effectiveOpts.hooks?.PreLLMRequest) {
+        await fireHooks("PreLLMRequest", effectiveOpts.hooks.PreLLMRequest, { event: "PreLLMRequest", sessionId, model: _effectiveModel, turn, ts: new Date().toISOString() }, _hookOpts, (msg) => onLog?.("stderr", msg));
+      }
+
+      const response = await withSpan(
+        "llm_turn",
+        { "orager.turn": turn, "orager.model": _effectiveModel },
+        async () => callWithRetry(
+        {
+          apiKey,
+          apiKeys: opts.apiKeys,
+          model: _effectiveModel,
+          models: _effectiveModels,
+          // Pass the session ID so openrouter.ts can set X-Session-Id for
+          // sticky routing, maximising prompt cache hits across turns.
+          sessionId,
+          messages,
+          tools: (inPlanMode
+            ? [...allTools.filter((t) => t.definition.readonly === true), exitPlanModeTool]
+            : allTools
+          ).map((t) => t.definition),
+          temperature: turnOverrides.temperature ?? opts.temperature,
+          top_p: turnOverrides.top_p ?? opts.top_p,
+          top_k: turnOverrides.top_k ?? opts.top_k,
+          max_completion_tokens: turnOverrides.max_completion_tokens,
+          frequency_penalty: opts.frequency_penalty,
+          presence_penalty: opts.presence_penalty,
+          repetition_penalty: opts.repetition_penalty,
+          min_p: opts.min_p,
+          seed: opts.seed,
+          stop: opts.stop,
+          tool_choice: opts.tool_choice,
+          parallel_tool_calls: opts.parallel_tool_calls,
+          reasoning: turnOverrides.reasoning ?? opts.reasoning,
+          provider: opts.provider,
+          transforms: opts.transforms,
+          preset: opts.preset,
+          siteUrl: opts.siteUrl,
+          siteName: opts.siteName,
+          // N-01: Forward the abort signal to the API call so in-flight
+          // requests are cancelled immediately when the daemon timeout fires,
+          // rather than waiting for the call to complete naturally.
+          signal: _effectiveAbortSignal,
+          response_format: opts.response_format,
+          disableContextCompression: summarizeAt > 0,
+          rateLimitTracker: rlTracker,
+          frozenSystemPromptLength,
+          // Per-agent user identifier for OpenRouter attribution/abuse detection.
+          // Falls back to sessionId (stable UUID) when no explicit agentId is set.
+          user: opts.agentId ?? sessionId,
+          // Ollama routing — when set, retry.ts dispatches to the local backend.
+          _ollamaBaseUrl,
+          // Stream partial tokens to consumers in real time.
+          // Each delta is emitted as a separate event so the adapter can
+          // forward it to Paperclip / other UIs without buffering the full turn.
+          onChunk: (chunk) => {
+            for (const choice of chunk.choices) {
+              const delta = choice.delta;
+              if (typeof delta?.content === "string" && delta.content) {
+                turnWasStreamed = true;
+                onEmit({ type: "text_delta", delta: delta.content });
+              }
+              const reasoning = delta?.reasoning ?? (delta as Record<string, unknown> | undefined)?.reasoning_content;
+              if (typeof reasoning === "string" && reasoning) {
+                turnWasStreamed = true;
+                onEmit({ type: "thinking_delta", delta: reasoning });
+              }
+            }
+          },
+        },
+        maxRetries,
+        (msg) => onLog?.("stderr", msg),
+      ),
+      );
+
+      // Mid-stream error after retries exhausted — treat as fatal loop error
+      if (response.isError) {
+        throw new Error(response.errorMessage ?? "OpenRouter stream error");
+      }
+      circuitBreaker.recordSuccess();
+
+      lastResponseModel = response.model;
+      lastFinishReason = response.finishReason;
+
+
+      // Accumulate usage
+      lastTurnPromptTokens = response.usage.prompt_tokens;
+      cumulativeUsage.prompt_tokens += response.usage.prompt_tokens;
+      cumulativeUsage.completion_tokens += response.usage.completion_tokens;
+      cumulativeUsage.total_tokens += response.usage.total_tokens;
+      cumulativeCachedTokens += response.cachedTokens;
+      cumulativeCacheWriteTokens += response.cacheWriteTokens;
+
+      // Accumulate cost — prefer caller-supplied pricing, fall back to live OpenRouter data
+      const previousTurnCostTotal = totalCostUsd;
+      const livePricing = getLiveModelPricing(turnOverrides.model ?? model);
+      const inputCost = opts.costPerInputToken ?? livePricing?.prompt ?? 0;
+      const outputCost = opts.costPerOutputToken ?? livePricing?.completion ?? 0;
+      if (inputCost > 0 || outputCost > 0) {
+        const turnInputCost  = inputCost  * response.usage.prompt_tokens;
+        const turnOutputCost = outputCost * response.usage.completion_tokens;
+        totalCostUsd += turnInputCost + turnOutputCost;
+        totalCostUsd  = Math.round(totalCostUsd  * 1e8) / 1e8;
+        inputCostUsd  += turnInputCost;
+        outputCostUsd += turnOutputCost;
+      }
+
+      // ── PostLLMResponse hook ──────────────────────────────────────────────
+      if (effectiveOpts.hooks?.PostLLMResponse) {
+        await fireHooks("PostLLMResponse", effectiveOpts.hooks.PostLLMResponse, {
+          event: "PostLLMResponse",
+          sessionId,
+          model: lastResponseModel,
+          turn,
+          inputTokens: response.usage.prompt_tokens,
+          outputTokens: response.usage.completion_tokens,
+          ts: new Date().toISOString(),
+        }, _hookOpts, (msg) => onLog?.("stderr", msg));
+      }
+
+      // ── OTel metrics: token counts ────────────────────────────────────────
+      recordTokens(response.usage.prompt_tokens, response.usage.completion_tokens, lastResponseModel);
+
+      // ── Generation metadata (fire-and-forget) ────────────────────────────
+      if (response.generationId) {
+        getOpenRouterProvider().fetchGenerationMeta!(apiKey, response.generationId).then((meta) => {
+          if (!meta) return;
+          // Use actual cost if available (overrides token-based estimate)
+          if (meta.totalCost > 0) {
+            const estimatedTurnCost = totalCostUsd - previousTurnCostTotal;
+            totalCostUsd = previousTurnCostTotal + meta.totalCost;
+            totalCostUsd = Math.round(totalCostUsd * 1e8) / 1e8;
+            // Warn when actual cost diverges significantly from the token-based estimate
+            // (can happen with model-specific pricing, volume discounts, or new model tiers)
+            if (estimatedTurnCost > 0) {
+              const divergence = Math.abs(meta.totalCost - estimatedTurnCost) / meta.totalCost;
+              if (divergence > 0.05) {
+                onLog?.("stderr",
+                  `[orager] cost estimate divergence: estimated $${estimatedTurnCost.toFixed(6)}, actual $${meta.totalCost.toFixed(6)} (${(divergence * 100).toFixed(1)}% off) — update costPerInputToken/costPerOutputToken for accuracy\n`,
+                );
+                log.warn("cost_estimate_divergence", { sessionId, turn, estimatedTurnCost, actualTurnCost: meta.totalCost, divergencePct: Math.round(divergence * 100) });
+              }
+            }
+            // ── Cost anomaly detection (P3-5) ────────────────────────────────
+            // Warn when this turn's actual cost exceeds COST_ANOMALY_MULTIPLIER × rolling average.
+            _turnCosts.push(meta.totalCost);
+            if (_turnCosts.length >= 2) {
+              // Compute rolling average excluding the current turn
+              const prevCosts = _turnCosts.slice(0, -1);
+              const rollingAvg = prevCosts.reduce((s, c) => s + c, 0) / prevCosts.length;
+              if (rollingAvg > 0 && meta.totalCost > COST_ANOMALY_MULTIPLIER * rollingAvg) {
+                onLog?.("stderr",
+                  `[orager] WARNING: cost anomaly — turn ${turn} cost $${meta.totalCost.toFixed(6)} is ${(meta.totalCost / rollingAvg).toFixed(1)}× the rolling average ($${rollingAvg.toFixed(6)})\n`,
+                );
+                log.warn("cost_anomaly", { sessionId, turn, turnCost: meta.totalCost, rollingAvg, multiplier: meta.totalCost / rollingAvg });
+              }
+            }
+          }
+          // Update provider health with the real provider name
+          recordProviderSuccess(response.model, meta.providerName, meta.latencyMs);
+          log.info("generation_meta", {
+            sessionId,
+            turn,
+            generationId: meta.id,
+            providerName: meta.providerName,
+            actualCostUsd: meta.totalCost,
+            cacheDiscountUsd: meta.cacheDiscount,
+            nativeTokensPrompt: meta.nativeTokensPrompt,
+            nativeTokensCompletion: meta.nativeTokensCompletion,
+            latencyMs: meta.latencyMs,
+          });
+        }).catch((err: unknown) => {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        process.stderr.write(`[orager] WARNING: generation metadata fetch failed for ${sessionId}: ${errMsg}\n`);
+      });
+      }
+
+      // Build assistant message and add to history
+      const assistantMsg: AssistantMessage = {
+        role: "assistant",
+        content: response.content || null,
+        tool_calls: response.toolCalls.length > 0 ? response.toolCalls : undefined,
+      };
+      messages.push(assistantMsg);
+
+      // Track last assistant text for result summary
+      if (response.content) {
+        lastAssistantText = response.content;
+      }
+
+      // ── Phase 4: Structured memory update ingestion ──────────────────────
+      // Parse <memory_update> blocks from the assistant response and write each
+      // validated payload to memory_entries.  Non-fatal — a write failure must
+      // never abort the agent run.  Also save a raw checkpoint so the current
+      // turn state is durably recorded whenever the model emits memory updates.
+      // Ingestion is gated by ingestionMode/ingestionInterval to avoid excessive
+      // write pressure on every turn in long-running sessions.
+      const ingestionMode = opts.ingestionMode ?? "periodic";
+      const ingestionInterval = (typeof opts.ingestionInterval === "number" && opts.ingestionInterval >= 1)
+        ? Math.floor(opts.ingestionInterval)
+        : 4;
+      const shouldIngest = ingestionMode === "every_turn" || (turn % ingestionInterval === 0);
+      if (memoryEnabled && !opts._suppressMemoryWrite && response.content && shouldIngest) {
+        const memUpdates = parseMemoryUpdates(response.content);
+        if (memUpdates.length > 0) {
+          let ingested = 0;
+          for (const upd of memUpdates) {
+            try {
+              if (isSqliteMemoryEnabled()) {
+                // Phase 6B: auto-embed when an embedding model is configured so
+                // FTS → embedding fallback can score these entries semantically.
+                let embeddingVec: number[] | undefined;
+                let embeddingModel: string | undefined;
+                if (opts.memoryEmbeddingModel && apiKey) {
+                  try {
+                    const vecs = await getOpenRouterProvider().callEmbeddings!(apiKey, opts.memoryEmbeddingModel, [upd.content]);
+                    if (vecs[0] && vecs[0].length > 0) {
+                      embeddingVec = vecs[0];
+                      embeddingModel = opts.memoryEmbeddingModel;
+                    }
+                  } catch { /* non-fatal — embed failure must not block ingestion */ }
+                }
+                await addMemoryEntrySqlite(effectiveMemoryKey, {
+                  content: upd.content,
+                  importance: upd.importance,
+                  tags: upd.tags,
+                  type: upd.type,
+                  runId: sessionId,
+                  _embedding: embeddingVec,
+                  _embeddingModel: embeddingModel,
+                });
+              } else {
+                // File-store fallback: load → add → save atomically under per-key lock
+                await withMemoryLock(effectiveMemoryKey, async () => {
+                  const store = await loadMemoryStoreAny(effectiveMemoryKey);
+                  const updated = addMemoryEntry(store, {
+                    content: upd.content,
+                    importance: upd.importance,
+                    tags: upd.tags,
+                    type: upd.type,
+                    runId: sessionId,
+                  });
+                  await saveMemoryStoreAny(effectiveMemoryKey, updated);
+                });
+              }
+              ingested++;
+            } catch { /* non-fatal */ }
+          }
+          if (ingested > 0) {
+            onLog?.("stderr", `[orager] ingested ${ingested} memory update(s) from assistant response\n`);
+            // Save a raw checkpoint so the turn state is durable after ingestion
+            await saveSessionCheckpoint(
+              sessionId,
+              effectiveMemoryKey,
+              turn,
+              null,
+              messages.slice(-20),
+            );
+          }
+        }
+      }
+
+      // ── JSON healing ─────────────────────────────────────────────────────
+      // When response_format is json_object, verify the response parses as JSON.
+      // On failure, inject a one-shot correction message and continue the loop
+      // so the model gets another chance. Capped at one healing attempt per run.
+      if (
+        opts.response_format?.type === "json_object" &&
+        !jsonHealingUsed &&
+        response.content &&
+        response.toolCalls.length === 0
+      ) {
+        try {
+          JSON.parse(response.content);
+        } catch {
+          jsonHealingUsed = true;
+          onLog?.("stderr", "[orager] JSON healing: previous response was not valid JSON — requesting retry\n");
+          messages.push({
+            role: "user",
+            content: "Your previous response was not valid JSON. Please respond with only valid JSON, no markdown fences.",
+          });
+          continue; // skip tool execution, go directly to next turn
+        }
+      }
+
+      // Build content blocks for the emit event
+      type ThinkingBlock = { type: "thinking"; thinking: string };
+      type TextBlock = { type: "text"; text: string };
+      type ToolUseBlock = { type: "tool_use"; id: string; name: string; input: Record<string, unknown> };
+      const contentBlocks: Array<ThinkingBlock | TextBlock | ToolUseBlock> = [];
+
+      if (response.reasoning) {
+        contentBlocks.push({ type: "thinking", thinking: response.reasoning });
+      }
+      if (response.content) {
+        contentBlocks.push({ type: "text", text: response.content });
+      }
+      for (const toolCall of response.toolCalls) {
+        let parsedInput: Record<string, unknown> = {};
+        try {
+          parsedInput = JSON.parse(toolCall.function.arguments) as Record<string, unknown>;
+        } catch {
+          parsedInput = { _raw: toolCall.function.arguments };
+        }
+        contentBlocks.push({ type: "tool_use", id: toolCall.id, name: toolCall.function.name, input: parsedInput });
+      }
+
+      onEmit({ type: "assistant", streamed: turnWasStreamed || undefined, message: { role: "assistant", content: contentBlocks } });
+
+      // Only break when there are truly no tools to execute
+      if (response.toolCalls.length === 0) {
+        break;
+      }
+
+      // ── Execute tool calls (sequential or parallel with concurrency cap) ──
+      const toolResults = opts.parallel_tool_calls
+        ? await runConcurrent(response.toolCalls, MAX_PARALLEL_TOOLS, executeOne, _effectiveAbortSignal ?? undefined)
+        : await (async () => {
+            const results: Awaited<ReturnType<typeof executeOne>>[] = [];
+            for (const tc of response.toolCalls) results.push(await executeOne(tc));
+            return results;
+          })();
+
+      type ToolEventItem = { type: "tool_result"; tool_use_id: string; content: string; is_error?: boolean; image_url?: string };
+      const toolEventContent: ToolEventItem[] = [];
+
+      // Pre-build lookup maps to avoid O(n²) find() calls in the tool result loop
+      const toolCallById = new Map(response.toolCalls.map((tc) => [tc.id, tc]));
+      const toolResultById = new Map(toolResults.map((r) => [r.id, r]));
+      const MAX_TOOL_RESULT_CHARS = 50_000;
+      // Collect image follow-up messages separately so all tool messages come
+      // as a contiguous block before any user messages — models expect strict
+      // assistant → [tool…] → assistant turn ordering.
+      const imageFollowUps: UserMessage[] = [];
+      for (const { id, content: resultContent, isError } of toolResults) {
+        const safeContent = truncateContent(resultContent, MAX_TOOL_RESULT_CHARS);
+        // Prompt injection guard: tag external content with its source tool
+        const tagToolOutputs = opts.tagToolOutputs !== false; // default true
+        const taggedContent = tagToolOutputs
+          ? (() => {
+              const tc = toolCallById.get(id);
+              const name = tc?.function.name ?? "tool";
+              return `<tool_result name="${name}">\n${safeContent}\n</tool_result>`;
+            })()
+          : safeContent;
+        messages.push({ role: "tool", tool_call_id: id, content: taggedContent });
+        const toolResultWithImage = toolResultById.get(id);
+        if (toolResultWithImage?.imageUrl) {
+          // Collect image as a follow-up user message — appended after all tool messages
+          imageFollowUps.push({
+            role: "user",
+            content: [
+              { type: "text", text: `[Image result from ${toolCallById.get(id)?.function.name ?? "tool"}]` },
+              { type: "image_url", image_url: { url: toolResultWithImage.imageUrl } },
+            ],
+          });
+        }
+        toolEventContent.push({ type: "tool_result", tool_use_id: id, content: safeContent, is_error: isError || undefined, image_url: toolResultWithImage?.imageUrl });
+      }
+      // Append image follow-ups after the full tool block
+      for (const imgMsg of imageFollowUps) messages.push(imgMsg);
+
+      onEmit({ type: "tool", content: toolEventContent });
+
+      // ── Plan mode: check if exit_plan_mode was called ─────────────────────
+      if (inPlanMode) {
+        const exitPlanToolCall = response.toolCalls.find(
+          (tc: ToolCall) => tc.function.name === PLAN_MODE_TOOL_NAME,
+        );
+        if (exitPlanToolCall) {
+          inPlanMode = false;
+          let planSummary = "";
+          try {
+            const parsed = JSON.parse(exitPlanToolCall.function.arguments);
+            if (typeof parsed.plan_summary === "string") planSummary = parsed.plan_summary;
+          } catch { /* malformed args — no summary */ }
+          onEmit({ type: "system", subtype: "plan_mode_exit", plan_summary: planSummary });
+          onLog?.("stderr", "[orager] plan mode exited — full execution enabled\n");
+        }
+      }
+
+      // ── Tool error budget check ───────────────────────────────────────────
+      const TOOL_ERROR_BUDGET = 5;
+      for (const r of toolResults) {
+        const name = toolCallById.get(r.id)?.function.name ?? "unknown";
+        if (r.isError) {
+          consecutiveToolErrors.set(name, (consecutiveToolErrors.get(name) ?? 0) + 1);
+        } else {
+          consecutiveToolErrors.set(name, 0);
+        }
+      }
+      let toolBudgetExceeded = false;
+      for (const [toolName, errorCount] of consecutiveToolErrors) {
+        if (errorCount >= TOOL_ERROR_BUDGET) {
+          log.warn("tool_error_budget_exceeded", { sessionId, toolName, consecutiveErrors: errorCount });
+          if (toolErrorBudgetHardStop) {
+            onLog?.("stderr", `[orager] tool error budget exceeded: '${toolName}' failed ${errorCount} consecutive times — stopping run\n`);
+            toolBudgetExceeded = true;
+          } else {
+            onLog?.("stderr", `[orager] WARNING: tool '${toolName}' has failed ${errorCount} consecutive times this run\n`);
+            consecutiveToolErrors.set(toolName, 0); // reset after warning to avoid spam
+          }
+        }
+      }
+      if (toolBudgetExceeded) {
+        const budgetToolName = [...consecutiveToolErrors.entries()].find(([, c]) => c >= TOOL_ERROR_BUDGET)?.[0] ?? "unknown";
+        const budgetResultEvent = {
+          type: "result" as const,
+          subtype: "error_tool_budget" as const,
+          result: `Tool '${budgetToolName}' exceeded the consecutive-failure budget (${TOOL_ERROR_BUDGET} failures). Run stopped.`,
+          session_id: sessionId,
+          finish_reason: "tool_error_budget",
+          usage: {
+            input_tokens: cumulativeUsage.prompt_tokens,
+            output_tokens: cumulativeUsage.completion_tokens,
+            cache_read_input_tokens: cumulativeCachedTokens,
+            cache_write_tokens: cumulativeCacheWriteTokens,
+          },
+          total_cost_usd: totalCostUsd,
+          cost_breakdown: costBreakdown(),
+          turnCount: turn,
+          toolMetrics: Object.fromEntries(toolMetrics),
+          filesChanged: opts.trackFileChanges ? Array.from(filesChanged) : undefined,
+        };
+        await saveSession({
+          sessionId,
+          model: lastResponseModel,
+          messages,
+          createdAt,
+          updatedAt: new Date().toISOString(),
+          turnCount: turn,
+          cwd,
+          cumulativeCostUsd: totalCostUsd,
+        }).catch((err: unknown) => {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        process.stderr.write(`[orager] WARNING: session save failed (budget-exceeded) for ${sessionId}: ${errMsg}\n`);
+        onEmit({ type: "warn", message: "session_save_failed_budget_exceeded: " + errMsg });
+      });
+        await emitResult(budgetResultEvent);
+        return;
+      }
+
+      // ── Loop detection ────────────────────────────────────────────────────
+      if (maxIdenticalTurns > 0 && response.toolCalls.length > 0) {
+        const sig = response.toolCalls
+          .map((tc) => `${tc.function.name}:${tc.function.arguments}`)
+          .sort()
+          .join("|");
+        if (sig === lastToolCallSig) {
+          identicalTurnStreak++;
+        } else {
+          identicalTurnStreak = 1;
+          lastToolCallSig = sig;
+          stuckAttempt = 0;
+        }
+        if (identicalTurnStreak >= maxIdenticalTurns) {
+          onLog?.(
+            "stderr",
+            `[orager] loop detected: identical tool calls for ${identicalTurnStreak} consecutive turns — injecting warning\n`,
+          );
+          log.warn("loop_detected", { sessionId, turn, streak: identicalTurnStreak, sig });
+          messages.push({
+            role: "user" as const,
+            content: makeStuckMessage(identicalTurnStreak, stuckAttempt++),
+          });
+          // After 3 injected warnings without the model breaking the pattern,
+          // abort to prevent indefinite token waste. stuckAttempt was just
+          // post-incremented above, so the value is 1-based here.
+          if (stuckAttempt >= 3) {
+            onLog?.(
+              "stderr",
+              `[orager] loop_abort: identical tool calls for ${identicalTurnStreak} turns — terminating after ${stuckAttempt} warnings\n`,
+            );
+            log.warn("loop_abort", { sessionId, turn, streak: identicalTurnStreak, stuckAttempt });
+            loopAborted = true;
+            break;
+          }
+          // Do NOT reset identicalTurnStreak — escalate by injecting a warning on every
+          // subsequent stuck turn until the pattern breaks naturally. Cap at threshold
+          // to avoid the number appearing misleadingly large in logs.
+          identicalTurnStreak = maxIdenticalTurns;
+        }
+      }
+
+      // ── Question mode: check if any tool triggered an approval request ────
+      const approvalResult = toolResults.find((r) => (r as { _approvalPending?: true })._approvalPending);
+      // Use type assertion to work around TypeScript loop narrowing (pendingApprovalRequest is reset at end of loop, so TS narrows it to null at loop start)
+      const capturedPendingApproval = pendingApprovalRequest as {
+        toolCallId: string;
+        toolName: string;
+        input: Record<string, unknown>;
+      } | null;
+      if (approvalResult && capturedPendingApproval) {
+        // Emit the question event
+        onEmit({
+          type: "question",
+          prompt: `Agent wants to run: ${capturedPendingApproval.toolName}(${JSON.stringify(capturedPendingApproval.input).slice(0, 200)})`,
+          choices: [
+            { key: "approve", label: "Approve", description: `Allow ${capturedPendingApproval.toolName} to run` },
+            { key: "deny",    label: "Deny",    description: `Skip ${capturedPendingApproval.toolName}` },
+          ],
+          toolCallId: capturedPendingApproval.toolCallId,
+          toolName: capturedPendingApproval.toolName,
+        });
+
+        // Save pending approval to session so the next run can resolve it.
+        // Save messages BEFORE the assistant message (we'll re-inject it on resume).
+        // At this point messages = [...priorMsgs, assistantMsg, ...toolResultMsgs]
+        // So we need to strip off 1 (assistantMsg) + toolResults.length (tool msgs)
+        const messagesBeforeThisTurn = messages.slice(0, messages.length - 1 - toolResults.length);
+        const questionedAt = new Date().toISOString();
+        await saveSession({
+          sessionId,
+          model: lastResponseModel,
+          messages: messagesBeforeThisTurn,
+          createdAt,
+          updatedAt: questionedAt,
+          turnCount: turn,
+          cwd,
+          cumulativeCostUsd: totalCostUsd,
+          pendingApproval: {
+            toolCallId: capturedPendingApproval.toolCallId,
+            toolName: capturedPendingApproval.toolName,
+            input: capturedPendingApproval.input,
+            assistantMessage: assistantMsg,
+            toolCalls: response.toolCalls,
+            questionedAt,
+          },
+        }).catch((err: unknown) => {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        process.stderr.write(`[orager] WARNING: session save failed (tool-approval) for ${sessionId}: ${errMsg}\n`);
+        onEmit({ type: "warn", message: "session_save_failed_tool_approval: " + errMsg });
+      });
+
+        // End the run — emit result with success subtype so session is preserved
+        {
+          const resultEvent = {
+            type: "result" as const,
+            subtype: "success" as const,
+            result: `[awaiting approval for ${capturedPendingApproval.toolName}]`,
+            session_id: sessionId,
+            finish_reason: "approval_required",
+            usage: {
+              input_tokens: cumulativeUsage.prompt_tokens,
+              output_tokens: cumulativeUsage.completion_tokens,
+              cache_read_input_tokens: cumulativeCachedTokens,
+              cache_write_tokens: cumulativeCacheWriteTokens,
+            },
+            total_cost_usd: totalCostUsd,
+          cost_breakdown: costBreakdown(),
+            turnCount: turn,
+            toolMetrics: Object.fromEntries(toolMetrics),
+            filesChanged: opts.trackFileChanges ? Array.from(filesChanged) : undefined,
+          };
+          await emitResult(resultEvent);
+        }
+        return; // Exit the agent loop
+      }
+      // Reset for next turn
+      pendingApprovalRequest = null;
+
+      // ── Finish tool detection ─────────────────────────────────────────────
+      if (opts.useFinishTool) {
+        const finishCallId = response.toolCalls.find(
+          (tc) => tc.function.name === FINISH_TOOL_NAME,
+        )?.id;
+        if (finishCallId) {
+          const finishResult = toolResults.find((r) => r.id === finishCallId);
+          if (finishResult && !finishResult.isError) {
+            lastAssistantText = finishResult.content || lastAssistantText;
+          }
+          break;
+        }
+      }
+
+      // ── Session summarization check ───────────────────────────────────────
+      // Use last turn's prompt_tokens from the API response — this is the
+      // actual token count for the current context and is more accurate and
+      // faster than the local estimateTokens() heuristic.
+      const actualPromptTokens = lastTurnPromptTokens > 0 ? lastTurnPromptTokens : await estimateTokens(messages, lastResponseModel);
+      const overTokenThreshold = summarizeAt > 0 && actualPromptTokens > contextWindow * summarizeAt;
+      const overTurnThreshold = summarizeTurnInterval > 0 && turnsSinceLastSummary >= summarizeTurnInterval;
+      const overMessageCap = messages.length > MAX_SESSION_MESSAGES;
+
+      // Skip summarization if the last attempt failed within SUMMARIZE_COOLDOWN_TURNS turns.
+      // This prevents repeated expensive API calls when the summarize model is unavailable.
+      const summarizeCoolingDown = turn - summarizeFailedAtTurn <= SUMMARIZE_COOLDOWN_TURNS;
+
+      if ((overTokenThreshold || overTurnThreshold || overMessageCap) && !summarizeCoolingDown) {
+        const reason = overMessageCap
+          ? `message count (${messages.length}) exceeded hard cap (${MAX_SESSION_MESSAGES})`
+          : overTurnThreshold
+          ? `turn interval reached (${turnsSinceLastSummary} turns since last summary)`
+          : `prompt tokens (${actualPromptTokens}) exceeds ${Math.round(summarizeAt * 100)}% of context window`;
+        onLog?.("stderr", `[orager] ${reason} — summarizing session...\n`);
+        try {
+          // Selective summarization: keep the last N assistant turns intact.
+          // Find the index to split at: walk backwards counting assistant turns.
+          let keepFromIndex = 0; // by default summarize everything
+          if (summarizeKeepRecentTurns > 0) {
+            let assistantCount = 0;
+            for (let i = messages.length - 1; i >= 0; i--) {
+              if (messages[i].role === "assistant") {
+                assistantCount++;
+                if (assistantCount >= summarizeKeepRecentTurns) {
+                  keepFromIndex = i;
+                  break;
+                }
+              }
+            }
+          }
+
+          const messagesToSummarize = keepFromIndex > 0 ? messages.slice(0, keepFromIndex) : messages;
+          const messagesToKeep = keepFromIndex > 0 ? messages.slice(keepFromIndex) : [];
+
+          // Phase 2: write a raw (pre-synthesis) checkpoint first so we don't
+          // lose context if the summarization API call crashes mid-flight.
+          const recentMessagesForCheckpoint = messagesToKeep.length > 0 ? messagesToKeep : messages.slice(-20);
+          await saveSessionCheckpoint(sessionId, effectiveMemoryKey, turn, null, recentMessagesForCheckpoint);
+
+          const summary = await summarizeSession(messagesToSummarize, apiKey, model, summarizeModel, opts.summarizePrompt);
+
+          // Phase 2: validate the summary before replacing context.
+          const validation = validateSummary(summary, messagesToSummarize);
+          if (!validation.valid) {
+            onLog?.("stderr", `[orager] WARNING: summary validation failed (${validation.reason}) — using unvalidated summary\n`);
+          }
+
+          // Phase 2: update checkpoint with the validated summary text.
+          await saveSessionCheckpoint(sessionId, effectiveMemoryKey, turn, summary, recentMessagesForCheckpoint);
+
+          const systemMsg = messages[0]?.role === "system" ? messages[0] : null;
+          const compacted: Message[] = [
+            ...(systemMsg ? [systemMsg] : []),
+            { role: "user" as const, content: `[Session summary — prior context compacted]\n${summary}` },
+            ...messagesToKeep,
+          ];
+          messages = compacted;
+          onLog?.("stderr", keepFromIndex > 0
+            ? `[orager] session summarized (kept last ${summarizeKeepRecentTurns} turns).\n`
+            : "[orager] session summarized and compacted.\n"
+          );
+          turnsSinceLastSummary = 0;
+          await saveSession({
+            sessionId,
+            model: lastResponseModel,
+            messages,
+            createdAt,
+            updatedAt: new Date().toISOString(),
+            turnCount: turn,
+            cwd,
+            summarized: true,
+            cumulativeCostUsd: totalCostUsd,
+          }).catch((err: unknown) => {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        process.stderr.write(`[orager] WARNING: session save failed (post-summarize) for ${sessionId}: ${errMsg}\n`);
+        onEmit({ type: "warn", message: "session_save_failed_post_summarize: " + errMsg });
+      });
+        } catch (summarizeErr) {
+          const msg = summarizeErr instanceof Error ? summarizeErr.message : String(summarizeErr);
+          onLog?.("stderr", `[orager] summarization failed (will retry in ${SUMMARIZE_COOLDOWN_TURNS} turns): ${msg}\n`);
+          summarizeFailedAtTurn = turn;
+        }
+      } else if ((overTokenThreshold || overTurnThreshold || overMessageCap) && summarizeCoolingDown) {
+        const keepN = opts.summarizeFallbackKeep ?? 40;
+        const dropped = messages.length - keepN - (messages[0]?.role === "system" ? 1 : 0);
+        onLog?.("stderr", `[orager] WARNING: summarization cooling down — discarding ${dropped > 0 ? dropped : "some"} messages to fit context (keeping last ${keepN}; ${SUMMARIZE_COOLDOWN_TURNS - (turn - summarizeFailedAtTurn)} turns until retry)\n`);
+        const systemMsg = messages[0]?.role === "system" ? messages[0] : null;
+        const recent = messages.slice(-keepN);
+        messages = systemMsg ? [systemMsg, ...recent] : recent;
+      }
+
+      // ── Soft cost limit warning ────────────────────────────────────────────
+      if (
+        opts.maxCostUsdSoft !== undefined &&
+        totalCostUsd >= opts.maxCostUsdSoft &&
+        (opts.maxCostUsd === undefined || totalCostUsd < opts.maxCostUsd)
+      ) {
+        onLog?.(
+          "stderr",
+          `[orager] soft cost limit reached ($${totalCostUsd.toFixed(4)} >= $${opts.maxCostUsdSoft}) — stopping agent loop\n`,
+        );
+        log.warn("cost_soft_limit_exceeded", {
+          sessionId,
+          totalCostUsd,
+          softLimit: opts.maxCostUsdSoft,
+          hardLimit: opts.maxCostUsd,
+        });
+        break; // exit the turn loop
+      }
+
+      // ── Cost limit check ──────────────────────────────────────────────────
+      if (opts.maxCostUsd !== undefined && totalCostUsd >= opts.maxCostUsd) {
+        onLog?.(
+          "stderr",
+          `[orager] cost limit reached ($${totalCostUsd.toFixed(6)} >= $${opts.maxCostUsd}) — stopping\n`,
+        );
+
+        await saveSession({
+          sessionId,
+          model: lastResponseModel,
+          messages,
+          createdAt,
+          updatedAt: new Date().toISOString(),
+          turnCount: turn,
+          cwd,
+          cumulativeCostUsd: totalCostUsd,
+        }).catch((err: unknown) => {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        process.stderr.write(`[orager] WARNING: session save failed (turn-end) for ${sessionId}: ${errMsg}\n`);
+        onEmit({ type: "warn", message: "session_save_failed_turn_end: " + errMsg });
+      });
+
+        {
+          const resultEvent = {
+            type: "result" as const,
+            subtype: "error_max_cost" as const,
+            result: lastAssistantText,
+            session_id: sessionId,
+            finish_reason: lastFinishReason,
+            usage: {
+              input_tokens: cumulativeUsage.prompt_tokens,
+              output_tokens: cumulativeUsage.completion_tokens,
+              cache_read_input_tokens: cumulativeCachedTokens,
+              cache_write_tokens: cumulativeCacheWriteTokens,
+            },
+            total_cost_usd: totalCostUsd,
+          cost_breakdown: costBreakdown(),
+            turnCount: turn,
+            toolMetrics: Object.fromEntries(toolMetrics),
+            filesChanged: opts.trackFileChanges ? Array.from(filesChanged) : undefined,
+          };
+          await emitResult(resultEvent);
+        }
+        return;
+      }
+
+      log.info("turn_complete", {
+        sessionId,
+        model: lastResponseModel,
+        turn,
+        promptTokens: cumulativeUsage.prompt_tokens,
+        completionTokens: cumulativeUsage.completion_tokens,
+        cachedInputTokens: cumulativeCachedTokens || undefined,
+        cacheWriteInputTokens: cumulativeCacheWriteTokens || undefined,
+        totalCostUsd,
+      });
+      // Phase 2: increment turn counter for the turn-based summarization trigger.
+      turnsSinceLastSummary++;
+      turn++;
+    }
+
+    // ── 6. After loop ─────────────────────────────────────────────────────
+    const subtype = loopAborted
+      ? ("error_loop_abort" as const)
+      : (maxTurns > 0 && turn >= maxTurns ? "error_max_turns" : "success") as "error_max_turns" | "success";
+
+    // Best-effort session save — a write failure should not turn a successful run into an error
+    try {
+      await saveSession({
+        sessionId,
+        model: lastResponseModel,
+        messages,
+        createdAt,
+        updatedAt: new Date().toISOString(),
+        turnCount: turn,
+        cwd,
+        cumulativeCostUsd: totalCostUsd,
+      });
+    } catch (saveErr) {
+      const saveErrMsg = saveErr instanceof Error ? saveErr.message : String(saveErr);
+      onLog?.("stderr", `[orager] WARNING: session save failed — session may not be resumable: ${saveErrMsg}\n`);
+      log.warn("session_save_failed", { sessionId, error: saveErrMsg });
+    }
+
+    // ── Phase 5: Session-end synthesis ────────────────────────────────────────
+    // After a successful run, synthesise a checkpoint summary so the next
+    // session (which won't know this thread ID) can warm-start with it.
+    // Only fires when:
+    //  - At least SESSION_END_MIN_TURNS turns completed (avoids noise runs)
+    //  - SQLite memory is enabled (checkpoints require SQLite)
+    //  - Memory is not disabled
+    const SESSION_END_MIN_TURNS = 3;
+    if (memoryEnabled && isSqliteMemoryEnabled() && turn >= SESSION_END_MIN_TURNS) {
+      try {
+        const assistantMsgsForSynthesis = messages.filter((m) => m.role === "assistant");
+        if (assistantMsgsForSynthesis.length > 0) {
+          const endSummary = await summarizeSession(
+            assistantMsgsForSynthesis,
+            apiKey,
+            model,
+            summarizeModel,
+            opts.summarizePrompt,
+          );
+          const endValidation = validateSummary(endSummary, assistantMsgsForSynthesis);
+          if (endValidation.valid) {
+            await saveSessionCheckpoint(
+              sessionId,
+              effectiveMemoryKey,
+              turn,
+              endSummary,
+              messages.slice(-20),
+            );
+            onLog?.("stderr", `[orager] session-end checkpoint saved (${endSummary.length} chars)\n`);
+            log.info("session_end_checkpoint_saved", {
+              sessionId,
+              contextId: effectiveMemoryKey,
+              turns: turn,
+              summaryChars: endSummary.length,
+            });
+          } else {
+            log.warn("session_end_checkpoint_invalid", {
+              sessionId,
+              contextId: effectiveMemoryKey,
+              reason: endValidation.reason,
+            });
+          }
+        }
+      } catch (synthErr) {
+        const synthErrMsg = synthErr instanceof Error ? synthErr.message : String(synthErr);
+        onLog?.("stderr", `[orager] WARNING: session-end synthesis failed — ${synthErrMsg}\n`);
+        log.warn("session_end_synthesis_failed", { sessionId, error: synthErrMsg });
+      }
+    }
+
+    // ── Phase 6C: Long-term distillation ──────────────────────────────────────
+    // When the namespace has accumulated more than DISTILL_ENTRY_THRESHOLD entries,
+    // compress the oldest/lowest-importance batch into denser facts.  Only fires
+    // when there is a meaningful batch to synthesise (≥10 qualifying entries).
+    // Non-fatal: any failure is logged and silently swallowed.
+    if (memoryEnabled && isSqliteMemoryEnabled()) {
+      try {
+        const entryCount = await getMemoryEntryCount(effectiveMemoryKey);
+        if (entryCount > DISTILL_ENTRY_THRESHOLD) {
+          const toDistill = await getEntriesForDistillation(effectiveMemoryKey, DISTILL_BATCH_SIZE);
+          if (toDistill.length >= 10) {
+            const distilled = await distillMemoryEntries(
+              toDistill,
+              apiKey,
+              model,
+              summarizeModel,
+            );
+            if (distilled.length > 0) {
+              await deleteMemoryEntriesByIds(toDistill.map((e) => e.id));
+              for (const d of distilled) {
+                await addMemoryEntrySqlite(effectiveMemoryKey, {
+                  content: d.content,
+                  importance: d.importance,
+                  tags: d.tags,
+                  runId: sessionId,
+                });
+              }
+              const approxAfter = entryCount - toDistill.length + distilled.length;
+              onLog?.("stderr", `[orager] distilled ${toDistill.length} entries → ${distilled.length} (store: ${entryCount} → ~${approxAfter})\n`);
+              log.info("memory_distilled", {
+                sessionId,
+                contextId: effectiveMemoryKey,
+                from: toDistill.length,
+                to: distilled.length,
+                totalBefore: entryCount,
+                totalAfterApprox: approxAfter,
+              });
+            }
+          }
+        }
+      } catch (distillErr) {
+        const distillErrMsg = distillErr instanceof Error ? distillErr.message : String(distillErr);
+        log.warn("memory_distillation_failed", { sessionId, error: distillErrMsg });
+      }
+    }
+
+    spanSetAttributes({ "orager.turns": turn, "orager.cost_usd": totalCostUsd });
+    log.info("loop_done", {
+      sessionId,
+      model: lastResponseModel,
+      subtype,
+      turns: turn,
+      totalCostUsd,
+      totalTokens: cumulativeUsage.total_tokens,
+    });
+    {
+      const resultEvent = {
+        type: "result" as const,
+        subtype,
+        result: lastAssistantText,
+        session_id: sessionId,
+        finish_reason: lastFinishReason,
+        usage: {
+          input_tokens: cumulativeUsage.prompt_tokens,
+          output_tokens: cumulativeUsage.completion_tokens,
+          cache_read_input_tokens: cumulativeCachedTokens,
+          cache_write_tokens: cumulativeCacheWriteTokens,
+        },
+        total_cost_usd: totalCostUsd,
+        cost_breakdown: costBreakdown(),
+        turnCount: turn,
+        toolMetrics: Object.fromEntries(toolMetrics),
+        filesChanged: opts.trackFileChanges ? Array.from(filesChanged) : undefined,
+      };
+      await emitResult(resultEvent);
+    }
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    circuitBreaker.recordFailure();
+
+    // Best-effort session save
+    try {
+      await saveSession({
+        sessionId,
+        model: lastResponseModel,
+        messages,
+        createdAt,
+        updatedAt: new Date().toISOString(),
+        turnCount: turn,
+        cwd,
+        cumulativeCostUsd: totalCostUsd,
+      });
+    } catch {
+      // ignore save failure during error handling
+    }
+
+    log.error("loop_error", {
+      sessionId,
+      model: lastResponseModel,
+      error: message,
+      turns: turn,
+      totalCostUsd,
+    });
+    {
+      const resultEvent = {
+        type: "result" as const,
+        subtype: "error" as const,
+        result: message,
+        session_id: sessionId,
+        finish_reason: lastFinishReason,
+        usage: {
+          input_tokens: cumulativeUsage.prompt_tokens,
+          output_tokens: cumulativeUsage.completion_tokens,
+          cache_read_input_tokens: cumulativeCachedTokens,
+          cache_write_tokens: cumulativeCacheWriteTokens,
+        },
+        total_cost_usd: totalCostUsd,
+        cost_breakdown: costBreakdown(),
+        turnCount: turn,
+        toolMetrics: Object.fromEntries(toolMetrics),
+        filesChanged: opts.trackFileChanges ? Array.from(filesChanged) : undefined,
+      };
+      await emitResult(resultEvent);
+    }
+  } finally {
+    // ── Guaranteed session save on any exit path ──────────────────────────
+    // Only triggers when no result event was emitted by the normal paths.
+    // The individual paths (normal completion, abort check, cost-limit, caught
+    // error) all call saveSession and emit a result. The finally block fires as
+    // a safety net for unexpected early exits (e.g. throw mid-tool that somehow
+    // bypasses the catch block) where neither a save nor a result event occurred.
+    if (!_resultEmitted) {
+      try {
+        await saveSession({
+          sessionId,
+          model: lastResponseModel,
+          messages,
+          createdAt,
+          updatedAt: new Date().toISOString(),
+          turnCount: turn,
+          cwd,
+          cumulativeCostUsd: totalCostUsd,
+        });
+      } catch (finalSaveErr) {
+        const fsMsg = finalSaveErr instanceof Error ? finalSaveErr.message : String(finalSaveErr);
+        process.stderr.write(`[orager] WARNING: finally-block session save failed for ${sessionId}: ${fsMsg}\n`);
+      }
+      const aborted = _effectiveAbortSignal?.aborted ?? false;
+      const fallbackEvent = {
+        type: "result" as const,
+        subtype: (aborted ? "error_cancelled" : "error") as "error_cancelled" | "error",
+        result: aborted ? "Run was aborted" : "Run ended unexpectedly",
+        session_id: sessionId,
+        finish_reason: null,
+        usage: {
+          input_tokens: cumulativeUsage.prompt_tokens,
+          output_tokens: cumulativeUsage.completion_tokens,
+          cache_read_input_tokens: cumulativeCachedTokens,
+          cache_write_tokens: cumulativeCacheWriteTokens,
+        },
+        total_cost_usd: totalCostUsd,
+        cost_breakdown: costBreakdown(),
+        turnCount: turn,
+        toolMetrics: Object.fromEntries(toolMetrics),
+        filesChanged: opts.trackFileChanges ? Array.from(filesChanged) : undefined,
+      };
+      try { _rawOnEmit(fallbackEvent); } catch { /* non-fatal */ }
+    }
+    // ── SessionStop hook and MCP cleanup ─────────────────────────────────
+    if (effectiveOpts.hooks?.SessionStop) {
+      await fireHooks("SessionStop", effectiveOpts.hooks.SessionStop, { event: "SessionStop", sessionId, ts: new Date().toISOString() }, _hookOpts, (msg) => onLog?.("stderr", msg));
+      // Note: hookErrorMode "fail" not enforced in SessionStop — already in cleanup
+    }
+    for (const h of mcpHandles) await h.close();
+    await releaseLock?.();
+    toolResultCache.clear(); // prevent cross-session stale cache hits
+    // Clear recovery manifest — session exited cleanly (or via finally safety net)
+    await clearRecoveryEntry(sessionId).catch(() => {});
+  }
+  }); // end withSpan("agent_loop")
+}

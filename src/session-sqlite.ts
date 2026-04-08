@@ -1,0 +1,453 @@
+/**
+ * SQLite-backed session store using WASM SQLite (synchronous API).
+ *
+ * Activated when ORAGER_DB_PATH env var is set.
+ * Schema: sessions table (indexed columns + full JSON data column)
+ *         session_locks table (advisory locking)
+ */
+import { openDb } from "./native-sqlite.js";
+import type { SqliteDatabase } from "./native-sqlite.js";
+import type { SessionData, SessionSummary, PruneResult } from "./types.js";
+import type { SessionStore } from "./session-store.js";
+import { CURRENT_SESSION_SCHEMA_VERSION, migrateSession } from "./session.js";
+import { checkDbSize } from "./db.js";
+import { localEmbedBatch, localEmbedWithTimeout, cosineSimilarity } from "./local-embeddings.js";
+import { getCachedQueryEmbedding, setCachedQueryEmbedding } from "./embedding-cache.js";
+
+const LOCK_STALE_MS = 5 * 60 * 1000;
+
+export class SqliteSessionStore implements SessionStore {
+  private readonly db: SqliteDatabase;
+
+  private constructor(db: SqliteDatabase) {
+    this.db = db;
+    this.db.pragma("journal_mode = WAL");
+    this.db.pragma("foreign_keys = ON");
+    this.db.pragma("synchronous = NORMAL");
+    this.db.pragma("auto_vacuum = INCREMENTAL");
+    this._migrate();
+    // Log a warning if the DB is approaching the size budget.
+    const sizeStatus = checkDbSize(db);
+    if (sizeStatus !== "ok") {
+      process.stderr.write(
+        sizeStatus === "prune"
+          ? `[orager] WARNING: DB size ≥80 MB — old sessions should be pruned.\n`
+          : `[orager] INFO: DB size ≥50 MB — approaching budget.\n`
+      );
+    }
+  }
+
+  static async create(dbPath: string): Promise<SqliteSessionStore> {
+    const db = await openDb(dbPath);
+    return new SqliteSessionStore(db);
+  }
+
+  private _migrate(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS sessions (
+        session_id  TEXT PRIMARY KEY,
+        model       TEXT NOT NULL DEFAULT '',
+        created_at  TEXT NOT NULL DEFAULT '',
+        updated_at  TEXT NOT NULL DEFAULT '',
+        turn_count  INTEGER NOT NULL DEFAULT 0,
+        cwd         TEXT NOT NULL DEFAULT '',
+        trashed     INTEGER NOT NULL DEFAULT 0,
+        summarized  INTEGER NOT NULL DEFAULT 0,
+        data        TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_sessions_trashed    ON sessions(trashed);
+
+      CREATE TABLE IF NOT EXISTS session_locks (
+        session_id TEXT PRIMARY KEY,
+        pid        INTEGER NOT NULL,
+        locked_at  INTEGER NOT NULL
+      );
+    `);
+    // FTS5 virtual table for full-text search over session summaries.
+    // session_id is UNINDEXED (stored but not tokenised — used for JOIN).
+    this.db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
+        session_id UNINDEXED,
+        content,
+        tokenize = 'porter ascii'
+      );
+    `);
+
+    // Triggers to keep sessions_fts in sync with the sessions table.
+    // Without these, the previous approach rebuilt the entire FTS index on
+    // every search() call (O(N) blocking work). These triggers maintain the
+    // index incrementally at write time instead.
+    this.db.exec(`
+      CREATE TRIGGER IF NOT EXISTS sessions_ai AFTER INSERT ON sessions BEGIN
+        INSERT INTO sessions_fts(session_id, content)
+        VALUES (new.session_id,
+                new.model || ' ' || new.cwd || ' ' || substr(new.data, 1, 2000));
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS sessions_au AFTER UPDATE ON sessions BEGIN
+        DELETE FROM sessions_fts WHERE session_id = old.session_id;
+        INSERT INTO sessions_fts(session_id, content)
+        VALUES (new.session_id,
+                new.model || ' ' || new.cwd || ' ' || substr(new.data, 1, 2000));
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS sessions_ad AFTER DELETE ON sessions BEGIN
+        DELETE FROM sessions_fts WHERE session_id = old.session_id;
+      END;
+    `);
+
+    // Back-fill the FTS index for any sessions that existed before these
+    // triggers were added (idempotent: INSERT OR IGNORE skips existing rows).
+    this.db.exec(`
+      INSERT OR IGNORE INTO sessions_fts(session_id, content)
+      SELECT session_id, model || ' ' || cwd || ' ' || substr(data, 1, 2000)
+      FROM sessions;
+    `);
+
+    // ── Phase 0 additive migrations ─────────────────────────────────────────
+    // Check existing columns before ALTER TABLE (SQLite has no ADD COLUMN IF NOT EXISTS).
+
+    const sessionCols = new Set(
+      (this.db.prepare("SELECT name FROM pragma_table_info('sessions')").all() as { name: string }[])
+        .map((r) => r.name)
+    );
+
+    // summary: standalone queryable condensed summary text for this session.
+    // Previously the summarized flag was a boolean; now the actual text is stored here.
+    if (!sessionCols.has("summary")) {
+      this.db.exec(`ALTER TABLE sessions ADD COLUMN summary TEXT`);
+    }
+
+    // context_id: logical namespace linking this session to a product/project context.
+    if (!sessionCols.has("context_id")) {
+      this.db.exec(`ALTER TABLE sessions ADD COLUMN context_id TEXT NOT NULL DEFAULT 'default'`);
+    }
+
+    // ── session_checkpoints table ────────────────────────────────────────────
+    // Stores condensed per-thread summaries for fast cross-session resumption.
+    // thread_id == session_id — kept as a separate name to avoid confusion with
+    // the full sessions table.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS session_checkpoints (
+        thread_id   TEXT PRIMARY KEY,
+        context_id  TEXT NOT NULL DEFAULT 'default',
+        last_turn   INTEGER NOT NULL DEFAULT 0,
+        summary     TEXT,
+        full_state  JSON,
+        updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX IF NOT EXISTS idx_checkpoint_context
+        ON session_checkpoints(context_id);
+    `);
+  }
+
+  async save(data: SessionData): Promise<void> {
+    this.db.prepare(`
+      INSERT INTO sessions
+        (session_id, model, created_at, updated_at, turn_count, cwd, trashed, summarized, data)
+      VALUES
+        (@sessionId, @model, @createdAt, @updatedAt, @turnCount, @cwd, @trashed, @summarized, @data)
+      ON CONFLICT(session_id) DO UPDATE SET
+        model      = excluded.model,
+        updated_at = excluded.updated_at,
+        turn_count = excluded.turn_count,
+        cwd        = excluded.cwd,
+        trashed    = excluded.trashed,
+        summarized = excluded.summarized,
+        data       = excluded.data
+    `).run({
+      sessionId:  data.sessionId,
+      model:      data.model,
+      createdAt:  data.createdAt,
+      updatedAt:  data.updatedAt,
+      turnCount:  data.turnCount,
+      cwd:        data.cwd ?? "",
+      trashed:    data.trashed ? 1 : 0,
+      summarized: data.summarized ? 1 : 0,
+      data:       JSON.stringify({ ...data, schemaVersion: CURRENT_SESSION_SCHEMA_VERSION }),
+    });
+  }
+
+  async load(sessionId: string): Promise<SessionData | null> {
+    const row = this.db
+      .prepare("SELECT data FROM sessions WHERE session_id = ? AND trashed = 0")
+      .get(sessionId) as { data: string } | undefined;
+    if (!row) return null;
+    try { return migrateSession(JSON.parse(row.data) as SessionData); } catch { return null; }
+  }
+
+  async loadRaw(sessionId: string): Promise<SessionData | null> {
+    const row = this.db
+      .prepare("SELECT data FROM sessions WHERE session_id = ?")
+      .get(sessionId) as { data: string } | undefined;
+    if (!row) return null;
+    try { return migrateSession(JSON.parse(row.data) as SessionData); } catch { return null; }
+  }
+
+  async delete(sessionId: string): Promise<void> {
+    this.db.prepare("DELETE FROM sessions WHERE session_id = ?").run(sessionId);
+  }
+
+  async list(opts?: { offset?: number; limit?: number }): Promise<SessionSummary[]> {
+    const limit  = opts?.limit  ?? 100;
+    const offset = opts?.offset ?? 0;
+    const rows = this.db.prepare(
+      "SELECT session_id, model, created_at, updated_at, turn_count, cwd, trashed " +
+      "FROM sessions ORDER BY updated_at DESC LIMIT ? OFFSET ?"
+    ).all(limit, offset) as Array<{
+      session_id: string; model: string; created_at: string;
+      updated_at: string; turn_count: number; cwd: string; trashed: number;
+    }>;
+    return rows.map((r) => ({
+      sessionId:  r.session_id,
+      model:      r.model,
+      createdAt:  r.created_at,
+      updatedAt:  r.updated_at,
+      turnCount:  r.turn_count,
+      cwd:        r.cwd,
+      trashed:    r.trashed === 1,
+    }));
+  }
+
+  async prune(olderThanMs: number): Promise<PruneResult> {
+    // Compacted (summarized) sessions are retained 3× longer than regular sessions.
+    const normalCutoff    = new Date(Date.now() - olderThanMs).toISOString();
+    const compactedCutoff = new Date(Date.now() - olderThanMs * 3).toISOString();
+    // Delete regular sessions older than normalCutoff AND
+    // compacted sessions older than compactedCutoff.
+    const victims = this.db
+      .prepare(`
+        SELECT session_id FROM sessions
+        WHERE (summarized = 0 AND updated_at < ?)
+           OR (summarized = 1 AND updated_at < ?)
+      `)
+      .all(normalCutoff, compactedCutoff) as Array<{ session_id: string }>;
+    let deleted = 0, errors = 0;
+    const del = this.db.prepare("DELETE FROM sessions WHERE session_id = ?");
+    for (const r of victims) {
+      try { del.run(r.session_id); deleted++; } catch { errors++; }
+    }
+    const kept = (this.db.prepare("SELECT COUNT(*) as n FROM sessions").get() as { n: number }).n;
+    return { deleted, kept, errors };
+  }
+
+  async deleteTrash(): Promise<PruneResult> {
+    const total = (this.db.prepare("SELECT COUNT(*) as n FROM sessions").get() as { n: number }).n;
+    const trashed = (this.db.prepare("SELECT COUNT(*) as n FROM sessions WHERE trashed=1").get() as { n: number }).n;
+    let errors = 0;
+    try { this.db.prepare("DELETE FROM sessions WHERE trashed = 1").run(); }
+    catch { errors++; }
+    return { deleted: trashed, kept: total - trashed, errors };
+  }
+
+  async search(query: string, limit = 20): Promise<SessionSummary[]> {
+    // Sanitize query for FTS5: strip operator characters and wrap as a phrase
+    // so the input is treated as a literal string search, not a query expression.
+    // FTS5 operators that need escaping: " * ^ ( ) [ ] { }
+    const sanitized = query.replace(/["*^()[\]{}]/g, " ").trim();
+    if (!sanitized) return [];
+    // Wrap in double-quotes to produce a phrase search; escape any remaining quotes
+    const ftsQuery = `"${sanitized.replace(/"/g, '""')}"`;
+
+    // Stage 1: FTS5 keyword search — fetch extra candidates for re-ranking
+    const ftsLimit = limit * 3;
+    const rows = this.db.prepare(`
+      SELECT s.session_id, s.model, s.created_at, s.updated_at, s.turn_count, s.cwd, s.trashed, s.summary
+      FROM sessions_fts f
+      JOIN sessions s ON s.session_id = f.session_id
+      WHERE sessions_fts MATCH ?
+        AND s.trashed = 0
+      ORDER BY rank
+      LIMIT ?
+    `).all(ftsQuery, ftsLimit) as Array<{
+      session_id: string; model: string; created_at: string;
+      updated_at: string; turn_count: number; cwd: string; trashed: number;
+      summary?: string;
+    }>;
+
+    const results = rows.map((r) => ({
+      sessionId: r.session_id, model: r.model, createdAt: r.created_at,
+      updatedAt: r.updated_at, turnCount: r.turn_count, cwd: r.cwd, trashed: r.trashed === 1,
+      _summary: r.summary ?? "",
+    }));
+
+    // Stage 2: Vector re-rank FTS candidates with 40/60 BM25/vector blending
+    if (results.length > limit) {
+      try {
+        let queryVec = getCachedQueryEmbedding("local", query);
+        if (!queryVec) {
+          queryVec = await localEmbedWithTimeout(query, 300);
+          if (queryVec) setCachedQueryEmbedding("local", query, queryVec);
+        }
+
+        if (queryVec) {
+          const texts = results.map(r => r._summary || `${r.model} ${r.cwd}`);
+          const vecs = await localEmbedBatch(texts);
+          if (vecs) {
+            const scored = results.map((r, i) => {
+              const sim = cosineSimilarity(queryVec!, vecs[i]!);
+              // FTS rank proxy: 1.0 for first result, decaying linearly
+              const ftsNorm = 1 - i / results.length;
+              return { ...r, blended: 0.4 * ftsNorm + 0.6 * sim };
+            });
+            scored.sort((a, b) => b.blended - a.blended);
+            return scored.slice(0, limit).map(({ _summary: _, blended: _b, ...rest }) => rest);
+          }
+        }
+      } catch { /* embedding unavailable — keep FTS order */ }
+    }
+
+    return results.slice(0, limit).map(({ _summary: _, ...rest }) => rest);
+  }
+
+  async acquireLock(sessionId: string): Promise<() => Promise<void>> {
+    const now = Date.now();
+
+    // Wrap SELECT + INSERT/UPDATE in an exclusive transaction to prevent the
+    // TOCTOU race where two processes both see no lock and both INSERT.
+    const tryAcquire = this.db.transaction((sid: string, nowMs: number) => {
+      const existing = this.db
+        .prepare("SELECT pid, locked_at FROM session_locks WHERE session_id = ?")
+        .get(sid) as { pid: number; locked_at: number } | undefined;
+
+      if (existing) {
+        const age = nowMs - existing.locked_at;
+        if (age < LOCK_STALE_MS) {
+          throw Object.assign(
+            new Error(
+              `Session ${sid} is already being resumed by PID ${existing.pid}. ` +
+              `Clears automatically in ${Math.ceil((LOCK_STALE_MS - age) / 1000)}s.`,
+            ),
+            { code: "SESSION_LOCKED" },
+          );
+        }
+        // Stale lock — overwrite atomically
+        this.db.prepare(
+          "UPDATE session_locks SET pid=?, locked_at=? WHERE session_id=?"
+        ).run(process.pid, nowMs, sid);
+      } else {
+        this.db.prepare(
+          "INSERT INTO session_locks (session_id, pid, locked_at) VALUES (?,?,?)"
+        ).run(sid, process.pid, nowMs);
+      }
+    });
+
+    // .exclusive() issues BEGIN EXCLUSIVE — only one writer can hold this at a time
+    tryAcquire.exclusive(sessionId, now);
+
+    let released = false;
+    return async () => {
+      if (released) return;
+      released = true;
+      try { this.db.prepare("DELETE FROM session_locks WHERE session_id=?").run(sessionId); }
+      catch { /* ignore */ }
+    };
+  }
+
+  // ── Session checkpoints (Phase 2) ────────────────────────────────────────────
+
+  /**
+   * Upsert a session checkpoint.
+   * Stores a condensed summary + the serialized recent turns for fast resumption.
+   * summary may be null when writing a raw (pre-synthesis) checkpoint.
+   */
+  saveCheckpoint(
+    threadId: string,
+    contextId: string,
+    lastTurn: number,
+    summary: string | null,
+    recentMessages: unknown[],
+  ): void {
+    this.db.prepare(`
+      INSERT INTO session_checkpoints
+        (thread_id, context_id, last_turn, summary, full_state, updated_at)
+      VALUES (?, ?, ?, ?, ?, datetime('now'))
+      ON CONFLICT(thread_id) DO UPDATE SET
+        context_id = excluded.context_id,
+        last_turn  = excluded.last_turn,
+        summary    = COALESCE(excluded.summary, session_checkpoints.summary),
+        full_state = excluded.full_state,
+        updated_at = excluded.updated_at
+    `).run(
+      threadId,
+      contextId,
+      lastTurn,
+      summary,
+      JSON.stringify(recentMessages),
+    );
+  }
+
+  /**
+   * Load the latest checkpoint for a thread.
+   * Returns null if no checkpoint exists.
+   */
+  loadCheckpoint(threadId: string): {
+    threadId: string;
+    contextId: string;
+    lastTurn: number;
+    summary: string | null;
+    fullState: unknown[];
+  } | null {
+    const row = this.db.prepare(`
+      SELECT thread_id, context_id, last_turn, summary, full_state
+      FROM session_checkpoints
+      WHERE thread_id = ?
+    `).get(threadId) as {
+      thread_id: string; context_id: string; last_turn: number;
+      summary: string | null; full_state: string;
+    } | undefined;
+
+    if (!row) return null;
+
+    let fullState: unknown[] = [];
+    try { fullState = JSON.parse(row.full_state) as unknown[]; } catch { /* ignore */ }
+
+    return {
+      threadId: row.thread_id,
+      contextId: row.context_id,
+      lastTurn: row.last_turn,
+      summary: row.summary,
+      fullState,
+    };
+  }
+
+  /**
+   * Load the most recent synthesised checkpoint for a context namespace across
+   * all session threads. Used for cold-start injection — a brand-new session
+   * can warm up with the prior session's summary without knowing its thread ID.
+   *
+   * Only returns rows where summary IS NOT NULL (i.e. a synthesis has completed).
+   * Returns null if no synthesised checkpoint exists for this context.
+   */
+  loadLatestCheckpointByContextId(contextId: string): {
+    threadId: string;
+    contextId: string;
+    lastTurn: number;
+    summary: string | null;
+    fullState: unknown[];
+  } | null {
+    const row = this.db.prepare(`
+      SELECT thread_id, context_id, last_turn, summary, full_state
+      FROM session_checkpoints
+      WHERE context_id = ? AND summary IS NOT NULL
+      ORDER BY updated_at DESC, rowid DESC LIMIT 1
+    `).get(contextId) as {
+      thread_id: string; context_id: string; last_turn: number;
+      summary: string | null; full_state: string;
+    } | undefined;
+
+    if (!row) return null;
+
+    let fullState: unknown[] = [];
+    try { fullState = JSON.parse(row.full_state) as unknown[]; } catch { /* ignore */ }
+
+    return {
+      threadId: row.thread_id,
+      contextId: row.context_id,
+      lastTurn: row.last_turn,
+      summary: row.summary,
+      fullState,
+    };
+  }
+}

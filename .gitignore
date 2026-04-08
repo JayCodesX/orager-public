@@ -1,0 +1,13 @@
+node_modules/
+dist/
+dist-binary/
+bin/
+.DS_Store
+*.js.map
+*.bun-build
+AUDIT_REPORT*.md
+CLAUDE.md
+.claude/
+docs/.vitepress/dist
+docs/.vitepress/cache
+test-results/

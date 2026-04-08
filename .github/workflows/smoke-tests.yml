@@ -1,0 +1,197 @@
+name: Smoke Tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  schedule:
+    # Nightly at 06:00 UTC
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: E2E smoke tests (free model)
+    runs-on: ubuntu-latest
+
+    # Environment protection: requires manual approval for PRs from
+    # non-collaborators. Secrets (OPENROUTER_API_KEY) are only available
+    # within this environment — fork PRs cannot access them.
+    #
+    # Setup: repo → Settings → Environments → Create "integration"
+    #   - Enable "Required reviewers" (add yourself)
+    #   - Check "Prevent self-review" = OFF (you're solo)
+    environment: integration
+
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      # llama-3.3-70b-instruct:free — stable, tool-capable, Meta-sponsored free tier.
+      # Override via repository variable SMOKE_MODEL if this model is ever retired.
+      SMOKE_MODEL: ${{ vars.SMOKE_MODEL || 'meta-llama/llama-3.3-70b-instruct:free' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Verify API key is available
+        run: |
+          if [ -z "$OPENROUTER_API_KEY" ]; then
+            echo "::error::OPENROUTER_API_KEY secret not available — is the 'integration' environment configured?"
+            exit 1
+          fi
+          echo "API key is set (${#OPENROUTER_API_KEY} chars)"
+          echo "Smoke model: $SMOKE_MODEL"
+
+      - name: Probe model availability
+        run: |
+          # Quick sanity check — if the model is rate-limited or removed, fail fast
+          # with a clear message rather than timing out across all test tiers.
+          STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{\"model\":\"$SMOKE_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":1}" \
+            https://openrouter.ai/api/v1/chat/completions || echo "000")
+          if [ "$STATUS" = "429" ]; then
+            echo "::warning::Model $SMOKE_MODEL is rate-limited (429). Smoke tests may fail."
+          elif [ "$STATUS" = "404" ] || [ "$STATUS" = "400" ]; then
+            echo "::error::Model $SMOKE_MODEL is unavailable (HTTP $STATUS). Update SMOKE_MODEL repo variable."
+            exit 1
+          else
+            echo "Model probe: HTTP $STATUS — OK"
+          fi
+
+      - name: Run smoke tests
+        run: bash scripts/test-smoke.sh
+        timeout-minutes: 15
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Smoke Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Model:** $SMOKE_MODEL" >> $GITHUB_STEP_SUMMARY
+          echo "- **Trigger:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+
+  tournament:
+    name: Prompt tournament (free model)
+    runs-on: ubuntu-latest
+    # Only run on push to main and nightly — not on every PR (slow / costly)
+    if: github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+
+    environment: integration
+
+    permissions:
+      contents: write   # needed to push the promote branch
+      pull-requests: write
+
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      # Alias PROTOCOL_API_KEY so the skip guard in tournament tests picks it up
+      PROTOCOL_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      SMOKE_MODEL: ${{ vars.SMOKE_MODEL || 'meta-llama/llama-3.3-70b-instruct:free' }}
+      # Three free tool-capable models rotated per task for cross-model coverage.
+      # Override via TOURNAMENT_MODELS repo variable if any model is retired.
+      TOURNAMENT_MODELS: ${{ vars.TOURNAMENT_MODELS || 'meta-llama/llama-3.3-70b-instruct:free,deepseek/deepseek-chat-v3-0324:free,qwen/qwen3.6-plus:free' }}
+      # LLM-as-judge: semantic scoring for generated tasks and supplementary
+      # scoring for static tasks. Off by default in CI smoke tests (burn-in enables it).
+      JUDGE_ENABLED: ${{ vars.JUDGE_ENABLED || '0' }}
+      JUDGE_MODEL: ${{ vars.JUDGE_MODEL || 'deepseek/deepseek-chat-v3-0324:free' }}
+      # Confirmed free vision models for vision benchmark track
+      VISION_MODELS: ${{ vars.VISION_MODELS || 'meta-llama/llama-3.2-11b-vision-instruct:free,qwen/qwen2.5-vl-72b-instruct:free,nvidia/nemotron-nano-12b-v2-vl:free' }}
+      VISION_SEED_OFFSET: "0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Verify API key is available
+        run: |
+          if [ -z "$PROTOCOL_API_KEY" ]; then
+            echo "::error::PROTOCOL_API_KEY secret not available — is the 'integration' environment configured?"
+            exit 1
+          fi
+          echo "API key is set (${#PROTOCOL_API_KEY} chars)"
+          echo "Tournament model: $SMOKE_MODEL"
+
+      # ── Layer 1: persist the agents DB across runs via Actions cache ─────────
+      - name: Restore agents DB cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.orager/agents
+          key: agents-db-${{ github.run_id }}
+          restore-keys: |
+            agents-db-
+
+      - name: Run prompt tournament
+        run: bun test tests/prompt-tournament.test.ts
+        timeout-minutes: 30
+
+      - name: Save agents DB cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.orager/agents
+          key: agents-db-${{ github.run_id }}
+
+      # ── Layer 2: per-agent variant table in the step summary ─────────────────
+      - name: Tournament summary
+        if: always()
+        run: bun scripts/tournament-summary.ts
+
+      # ── Layer 3: promote winning variants and open a PR if any found ──────────
+      - name: Check for variant winners
+        if: success()
+        id: promote
+        run: |
+          RESULT=$(bun scripts/tournament-promote.ts)
+          echo "result=$RESULT" >> "$GITHUB_OUTPUT"
+          if [ "$RESULT" != "[]" ] && [ -n "$RESULT" ]; then
+            echo "has_winners=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open promotion PR
+        if: steps.promote.outputs.has_winners == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH="chore/promote-variants-${{ github.run_number }}"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git checkout -b "$BRANCH"
+          git add src/agents/promoted-variants.json
+          git commit -m "chore(agents): promote winning prompt variants [run ${{ github.run_number }}]"
+          git push origin "$BRANCH"
+          gh pr create \
+            --title "chore(agents): promote winning variants (run ${{ github.run_number }})" \
+            --body "$(printf '## Promoted variants\n\nAutomatic promotion from tournament run [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).\n\n**Winners:** `${{ steps.promote.outputs.result }}`\n\nMerging this PR bakes the improved prompts into `promoted-variants.json`. They take effect for all users on the next release.\n\n> To roll back, revert this PR or clear the entry from `src/agents/promoted-variants.json`.')" \
+            --base main
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "- **Model:** $SMOKE_MODEL" >> $GITHUB_STEP_SUMMARY
+          echo "- **Trigger:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
