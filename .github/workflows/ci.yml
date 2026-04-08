@@ -62,7 +62,7 @@ jobs:
   binary-pr:
     name: Binary smoke test
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]'
     permissions:
       contents: read
 
@@ -115,19 +115,12 @@ jobs:
       - name: Smoke test — linux binary
         run: ./bin/orager-linux-x64 --version
 
-      - name: Upload binaries as workflow artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: orager-binaries-${{ github.sha }}
-          path: bin/
-          retention-days: 90
-
       - name: Upload latest binaries artifact (always latest on main)
         uses: actions/upload-artifact@v4
         with:
           name: orager-binaries-latest
           path: bin/
-          retention-days: 90
+          retention-days: 1
           overwrite: true
 
   # ── Quality gates — enforced by branch protection ────────────────────────────

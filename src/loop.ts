@@ -13,6 +13,8 @@ import type {
 } from "./types.js";
 import { applyProfileAsync } from "./profiles.js";
 import { loadProjectInstructions } from "./project-instructions.js";
+import { buildIdentityBlock, appendDailyLog } from "./agent-identity.js";
+import { processCorrection } from "./correction-detector.js";
 import { loadProjectCommands, resolveCommandPrompt, buildCommandsSystemPrompt } from "./project-commands.js";
 import { connectAllMcpServers } from "./mcp-client.js";
 import type { McpClientHandle } from "./mcp-client.js";
@@ -39,7 +41,7 @@ import { loadSkillsFromDirs, buildSkillsSystemPrompt, buildSkillTools } from "./
 import { retrieveSkills, buildSkillsPromptSection, updateSkillOutcomes } from "./skillbank.js";
 import { localEmbed } from "./local-embeddings.js";
 import { processInput, detectModalitiesFromBlocks } from "./input-processor.js";
-import { ALL_TOOLS, finishTool, BROWSER_TOOLS, makeAgentTool, buildAgentsSystemPrompt } from "./tools/index.js";
+import { ALL_TOOLS, finishTool, BROWSER_TOOLS, BROWSER_DEV_TOOLS, DEV_SERVER_TOOLS, makeAgentTool, buildAgentsSystemPrompt } from "./tools/index.js";
 import { getAgentsDb, loadAllAgents, loadAgentsForTask } from "./agents/registry.js";
 import { recordAgentScore } from "./agents/score.js";
 import { makeGenerateAgentTool } from "./agents/generate.js";
@@ -361,6 +363,27 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
   // The process-global singleton (used by /metrics) is still updated in openrouter.ts.
   const rlTracker = new RateLimitTracker();
 
+  // ── Process file attachments BEFORE preflight so vision swap can see image blocks ─
+  // Note: attachments are processed for both new sessions and resumed sessions,
+  // since users can attach files in follow-up messages.
+  if (opts.attachments && opts.attachments.length > 0) {
+    try {
+      const processed = await processInput(prompt, opts.attachments);
+      _inputModalities = processed.modalities as Set<string>;
+      _effectivePromptContent = [
+        ...processed.contentBlocks,
+        ...(opts.promptContent ?? []),
+      ];
+      if (processed.hasImages) {
+        onLog?.("stderr", `[orager] ${processed.modalities.size > 1 ? [...processed.modalities].filter(m => m !== "text").join("+") + " " : ""}input detected — encoding ${opts.attachments.length} attachment(s)\n`);
+      }
+    } catch (attachErr) {
+      onLog?.("stderr", `[orager] attachment processing failed: ${attachErr instanceof Error ? attachErr.message : String(attachErr)}\n`);
+    }
+  } else if (opts.promptContent) {
+    _inputModalities = detectModalitiesFromBlocks(opts.promptContent) as Set<string>;
+  }
+
   // Fetch live model metadata (context windows + pricing + capabilities) from OpenRouter.
   // ── Pre-flight: model metadata, deprecation, capability, vision swap, Ollama ─
   // Extracted to loop-preflight.ts (Sprint 6 decomposition).
@@ -514,6 +537,18 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
   // ── 2. Build system prompt + tool list ────────────────────────────────────
   let systemPrompt =
     "You are an autonomous software engineering agent. Work through the user's task completely using the available tools. Think step by step. When you are done, provide a concise summary of what you accomplished.";
+
+  // ── Agent identity (persistent identity files) ──────────────────────────────
+  // When identityId is set, load soul/manual/lessons/patterns/memory/daily-log
+  // and inject as the agent's identity context. This comes before skills and
+  // project instructions since it defines WHO the agent is.
+  const identityId = opts.identityId;
+  if (identityId) {
+    const identityBlock = buildIdentityBlock(identityId);
+    if (identityBlock) {
+      systemPrompt += "\n\n" + identityBlock;
+    }
+  }
 
   const skills = await loadSkillsFromDirs(addDirs);
   const skillsSection = buildSkillsSystemPrompt(skills);
@@ -688,7 +723,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
         : undefined,
     ),
     ...(opts.useFinishTool ? [finishTool] : []),
-    ...(opts.enableBrowserTools ? BROWSER_TOOLS : []),
+    ...(opts.enableBrowserTools ? [...BROWSER_TOOLS, ...BROWSER_DEV_TOOLS, ...DEV_SERVER_TOOLS] : []),
     ...(opts.extraTools ?? []),
   ];
 
@@ -1262,26 +1297,8 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
     }
   }
 
-  // ── Process file attachments (input-processor) ────────────────────────────
-  // If attachments are provided, encode them into content blocks and merge with
-  // any pre-built promptContent. The resulting modalities set is stored for use
-  // by the confidence router's modality_mismatch signal.
-  if (!isResume && opts.attachments && opts.attachments.length > 0) {
-    try {
-      const processed = await processInput(resolvedPrompt, opts.attachments);
-      _inputModalities = processed.modalities as Set<string>;
-      // Merge with any caller-provided content blocks
-      _effectivePromptContent = [
-        ...processed.contentBlocks,
-        ...(opts.promptContent ?? []),
-      ];
-      if (processed.hasImages) {
-        onLog?.("stderr", `[orager] ${processed.modalities.size > 1 ? [...processed.modalities].filter(m => m !== "text").join("+") + " " : ""}input detected — encoding ${opts.attachments.length} attachment(s)\n`);
-      }
-    } catch { /* non-fatal — proceed without attachments */ }
-  } else if (opts.promptContent) {
-    _inputModalities = detectModalitiesFromBlocks(opts.promptContent) as Set<string>;
-  }
+  // NOTE: Attachment processing was moved before preflight (above) so the vision
+  // model swap can detect image blocks. No duplicate processing here.
 
   const userMessage: UserMessage = _effectivePromptContent && _effectivePromptContent.length > 0
     ? { role: "user", content: _effectivePromptContent }
@@ -1292,6 +1309,21 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
   } else {
     const systemMessage: SystemMessage = { role: "system", content: systemPrompt };
     messages = [systemMessage, userMessage];
+  }
+
+  // ── Correction detection (Phase 6: Decision Framework Training) ───────────
+  // When an identity-backed agent receives a follow-up message (resume),
+  // check if the user is correcting the agent. If so, extract a lesson
+  // asynchronously and persist it to lessons.md + patterns.md.
+  if (identityId && isResume && typeof userMessage.content === "string") {
+    const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant");
+    if (lastAssistant && typeof lastAssistant.content === "string") {
+      processCorrection(identityId, apiKey, model, userMessage.content, lastAssistant.content).then((extracted) => {
+        if (extracted) {
+          onLog?.("stderr", `[orager] correction detected — lesson extracted and saved to ${identityId}/lessons.md\n`);
+        }
+      }).catch(() => { /* non-fatal */ });
+    }
   }
 
   // ── 5. Agent loop ─────────────────────────────────────────────────────────
@@ -1454,6 +1486,21 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
         turnCount: resultEvent.turnCount,
         ts: new Date().toISOString(),
       } satisfies HookPayload, _hookOpts, (msg) => onLog?.("stderr", msg));
+    }
+    // ── Daily log: auto-append run summary for identity-backed agents ────
+    if (identityId) {
+      try {
+        const summary = [
+          `**Model:** ${lastResponseModel}`,
+          `**Turns:** ${turn}`,
+          `**Cost:** $${resultEvent.total_cost_usd?.toFixed(4) ?? "0.0000"}`,
+          `**Result:** ${resultEvent.subtype}`,
+          resultEvent.result ? `\n${resultEvent.result.slice(0, 500)}` : "",
+        ].filter(Boolean).join("\n");
+        appendDailyLog(identityId, summary);
+      } catch {
+        // Non-fatal — don't break the run if daily log write fails
+      }
     }
   };
 
@@ -2276,7 +2323,10 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
             }
           }
 
-          const messagesToSummarize = keepFromIndex > 0 ? messages.slice(0, keepFromIndex) : messages;
+          const candidateMessages = keepFromIndex > 0 ? messages.slice(0, keepFromIndex) : messages;
+          // Preserve messages flagged as neverCompress — they survive summarization verbatim
+          const messagesToSummarize = candidateMessages.filter((m) => !m.metadata?.neverCompress);
+          const preservedMessages = candidateMessages.filter((m) => m.metadata?.neverCompress && m.role !== "system");
           const messagesToKeep = keepFromIndex > 0 ? messages.slice(keepFromIndex) : [];
 
           // Phase 2: write a raw (pre-synthesis) checkpoint first so we don't
@@ -2299,6 +2349,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<void> {
           const compacted: Message[] = [
             ...(systemMsg ? [systemMsg] : []),
             { role: "user" as const, content: `[Session summary — prior context compacted]\n${summary}` },
+            ...preservedMessages,
             ...messagesToKeep,
           ];
           messages = compacted;

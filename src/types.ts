@@ -1,8 +1,15 @@
 // ── OpenAI-compatible message types ────────────────────────────────────────
 
+/** Optional metadata attached to any message. */
+export interface MessageMetadata {
+  /** When true, this message is preserved verbatim during context summarization. */
+  neverCompress?: boolean;
+}
+
 export interface SystemMessage {
   role: "system";
   content: string;
+  metadata?: MessageMetadata;
 }
 
 export interface UserMessageContentText {
@@ -20,18 +27,21 @@ export type UserMessageContentBlock = UserMessageContentText | UserMessageConten
 export interface UserMessage {
   role: "user";
   content: string | UserMessageContentBlock[];
+  metadata?: MessageMetadata;
 }
 
 export interface AssistantMessage {
   role: "assistant";
   content: string | null;
   tool_calls?: ToolCall[];
+  metadata?: MessageMetadata;
 }
 
 export interface ToolMessage {
   role: "tool";
   tool_call_id: string;
   content: string;
+  metadata?: MessageMetadata;
 }
 
 export type Message = SystemMessage | UserMessage | AssistantMessage | ToolMessage;
@@ -391,6 +401,15 @@ export interface EmitUiRenderEvent {
   spec: UiComponentSpec;
 }
 
+/** Emitted when the agent navigates, starts a dev server, or closes the browser. */
+export interface EmitBrowserEvent {
+  type: "browser";
+  action: "navigate" | "server_ready" | "close";
+  url?: string;
+  port?: number;
+  sessionId: string;
+}
+
 export type EmitEvent =
   | EmitInitEvent
   | EmitAssistantEvent
@@ -401,7 +420,8 @@ export type EmitEvent =
   | EmitThinkingDeltaEvent
   | EmitWarnEvent
   | EmitPlanModeEvent
-  | EmitUiRenderEvent;
+  | EmitUiRenderEvent
+  | EmitBrowserEvent;
 
 // ── OpenRouter API types ─────────────────────────────────────────────────────
 
@@ -1268,6 +1288,13 @@ export interface AgentLoopOptions {
   readProjectInstructions?: boolean;
 
   /**
+   * Agent identity slug. When set, loads persistent identity files
+   * (soul.md, operating-manual.md, lessons.md, patterns.md, memory.md, daily-logs/)
+   * from ~/.orager/agents/<identityId>/ and injects them into the system prompt.
+   */
+  identityId?: string;
+
+  /**
    * MCP servers to connect to. Key is the server name (used as tool prefix mcp__<name>__<tool>).
    *
    * Each value is either a stdio config `{ command, args?, env? }` (spawns a subprocess)
@@ -1610,6 +1637,21 @@ export interface AgentDefinition {
    * Enable for agents that need to understand project conventions (e.g. a coder agent).
    */
   readProjectInstructions?: boolean;
+
+  /**
+   * Agent identity directory slug. When set, the agent boots with persistent
+   * identity files (soul.md, operating-manual.md, lessons.md, patterns.md,
+   * memory.md, daily-logs/) from ~/.orager/agents/<identityId>/.
+   * The boot sequence injects these into the system prompt.
+   */
+  identityId?: string;
+
+  /**
+   * Chain of command — ordered list of agent IDs this agent reports to.
+   * Used for escalation routing in the channel system.
+   * First entry is the direct supervisor; last is the human user.
+   */
+  chainOfCommand?: string[];
 }
 
 // ── Agent score / stats ──────────────────────────────────────────────────────

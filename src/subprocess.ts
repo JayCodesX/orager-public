@@ -24,6 +24,26 @@ import { log } from "./logger.js";
 import type { AgentLoopOptions, EmitEvent } from "./types.js";
 import { resolveUiResponse } from "./tools/render-ui.js";
 import type { CompareParams, CompareChunk, CompareResult } from "./compare.js";
+import {
+  listIdentities, loadIdentity, createIdentity, updateIdentityFile,
+  deleteIdentity, appendLesson, appendDailyLog, buildIdentityBlock,
+} from "./agent-identity.js";
+import {
+  indexAgent, rebuildIndex, removeAgentFromIndex, searchIdentities,
+} from "./agent-identity-index.js";
+import {
+  createChannel, getChannel, getChannelByName, listChannels, updateChannel, deleteChannel,
+  addMember, removeMember, listMembers,
+  postMessage, getMessages, getMessage, searchMessages,
+} from "./channel.js";
+import { routeMessage, onAgentWake, buildWakePrompt } from "./channel-router.js";
+import {
+  createSchedule, getSchedule, listSchedules, updateSchedule, deleteSchedule, getRunHistory,
+} from "./scheduler-db.js";
+import {
+  loadAndStartAll, stopAll, registerJob, unregisterJob, isRunning, activeJobCount,
+  setExecutor,
+} from "./scheduler.js";
 
 // ── Safety limits ────────────────────────────────────────────────────────────
 // Reject any single JSON-RPC line exceeding this size to prevent OOM on a
@@ -390,6 +410,139 @@ export async function startSubprocessServer(): Promise<void> {
   const rl = readline.createInterface({ input: process.stdin });
   let agentRunning = false;
 
+  // ── Wire executor for scheduled tasks ───────────────────────────────────
+  // When a cron job fires, the scheduler calls this to run the agent loop.
+  // API keys are available as env vars (injected by the desktop on sidecar start).
+  setExecutor(async (schedule, _isCatchup) => {
+    const startTime = Date.now();
+    const apiKey =
+      process.env["OPENROUTER_API_KEY"] ??
+      process.env["ANTHROPIC_API_KEY"] ??
+      process.env["OPENAI_API_KEY"] ??
+      process.env["GEMINI_API_KEY"] ??
+      process.env["DEEPSEEK_API_KEY"] ??
+      "";
+
+    if (!apiKey) {
+      return { status: "error", errorMessage: "No API key configured", durationMs: 0 };
+    }
+
+    // Build identity context if the schedule owner is an agent
+    let systemPrefix = "";
+    let agentModel: string | undefined;
+    let agentMaxTurns: number | undefined;
+    if (schedule.ownerType === "agent") {
+      const block = buildIdentityBlock(schedule.ownerId);
+      if (block) systemPrefix = block + "\n\n";
+      // Read agent's config for model/limits preference
+      const { loadAgentConfig: loadCfg } = await import("./agent-config.js");
+      const cfg = loadCfg(schedule.ownerId);
+      agentModel = cfg.model;
+      agentMaxTurns = cfg.maxTurns;
+    }
+
+    const prompt = systemPrefix + schedule.prompt;
+    let resultText = "";
+    let costUsd = 0;
+
+    try {
+      await runAgentLoop({
+        prompt,
+        model: schedule.model || agentModel || process.env["ORAGER_MODEL"] || "openrouter/auto",
+        apiKey,
+        sessionId: null,
+        addDirs: [],
+        maxTurns: agentMaxTurns ?? 10,
+        cwd: process.env["HOME"] || "/tmp",
+        dangerouslySkipPermissions: true,
+        verbose: false,
+        onEmit: (event) => {
+          if (event.type === "assistant" && event.message?.content) {
+            for (const block of event.message.content) {
+              if (block.type === "text") resultText += block.text;
+            }
+          }
+          if (event.type === "result" && typeof event.total_cost_usd === "number") {
+            costUsd = event.total_cost_usd;
+          }
+        },
+      });
+
+      return {
+        status: "success",
+        durationMs: Date.now() - startTime,
+        costUsd,
+        result: resultText || undefined,
+      };
+    } catch (err) {
+      return {
+        status: "error",
+        durationMs: Date.now() - startTime,
+        costUsd,
+        errorMessage: err instanceof Error ? err.message : String(err),
+      };
+    }
+  });
+
+  // ── Wire wake handler for @mention routing ──────────────────────────────
+  // When a channel message @mentions an agent, the router calls this to run
+  // the agent, then posts the response back to the channel.
+  onAgentWake(async (event) => {
+    const apiKey =
+      process.env["OPENROUTER_API_KEY"] ??
+      process.env["ANTHROPIC_API_KEY"] ??
+      process.env["OPENAI_API_KEY"] ??
+      process.env["GEMINI_API_KEY"] ??
+      process.env["DEEPSEEK_API_KEY"] ??
+      "";
+
+    if (!apiKey) return null;
+
+    // Read agent's preferred model from config
+    const { loadAgentConfig: loadCfg } = await import("./agent-config.js");
+    const cfg = loadCfg(event.agentId);
+
+    // Build the prompt with channel context and identity
+    const identityBlock = buildIdentityBlock(event.agentId);
+    const wakePrompt = (identityBlock ? identityBlock + "\n\n" : "") + buildWakePrompt(event);
+
+    let resultText = "";
+
+    try {
+      await runAgentLoop({
+        prompt: wakePrompt,
+        model: cfg.model || process.env["ORAGER_MODEL"] || "openrouter/auto",
+        apiKey,
+        sessionId: null,
+        addDirs: [],
+        maxTurns: cfg.maxTurns ?? 5,
+        cwd: process.env["HOME"] || "/tmp",
+        dangerouslySkipPermissions: true,
+        verbose: false,
+        onEmit: (ev) => {
+          if (ev.type === "assistant" && ev.message?.content) {
+            for (const block of ev.message.content) {
+              if (block.type === "text") resultText += block.text;
+            }
+          }
+        },
+      });
+
+      return resultText || null;
+    } catch (err) {
+      process.stderr.write(`[wake-handler] agent ${event.agentId} failed: ${err instanceof Error ? err.message : String(err)}\n`);
+      return null;
+    }
+  });
+
+  // ── Auto-start scheduler ────────────────────────────────────────────────
+  // Load cron jobs and start firing on schedule (with missed-run catch-up).
+  loadAndStartAll().then((result) => {
+    process.stderr.write(`[scheduler] started: ${result.loaded} jobs loaded, ${result.catchups} catch-ups\n`);
+  }).catch((err) => {
+    process.stderr.write(`[scheduler] failed to start: ${err instanceof Error ? err.message : String(err)}\n`);
+  });
+
   const dispatch = async (request: JsonRpcRequest): Promise<void> => {
     switch (request.method) {
       // ── License RPCs (instant, no agent loop) ──────────────────────────
@@ -596,6 +749,784 @@ export async function startSubprocessServer(): Promise<void> {
         if (params?.requestId) {
           resolveUiResponse(params.requestId, JSON.stringify(params.value ?? null));
         }
+        break;
+      }
+
+      // ── Agent identity CRUD ────────────────────────────────────────────
+      case "agent/identity/list": {
+        writeLine(process.stdout, {
+          jsonrpc: "2.0", id: request.id,
+          result: listIdentities(),
+        });
+        break;
+      }
+
+      case "agent/identity/get": {
+        const params = request.params as { agentId: string } | undefined;
+        if (!params?.agentId) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32602, message: "Missing required param: agentId" },
+          });
+          break;
+        }
+        const identity = loadIdentity(params.agentId);
+        if (!identity) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32000, message: `Agent identity "${params.agentId}" not found` },
+          });
+          break;
+        }
+        // Convert Map to plain object for JSON serialization
+        writeLine(process.stdout, {
+          jsonrpc: "2.0", id: request.id,
+          result: { ...identity, dailyLogs: Object.fromEntries(identity.dailyLogs) },
+        });
+        break;
+      }
+
+      case "agent/identity/create": {
+        const params = request.params as {
+          agentId: string;
+          soul?: string;
+          operatingManual?: string;
+          memory?: string;
+          patterns?: string;
+          config?: {
+            role?: "primary" | "specialist";
+            reportsTo?: string | null;
+            title?: string;
+            provider?: string;
+            model?: string;
+            fallbackModel?: string;
+            visionModel?: string;
+            maxTurns?: number;
+            maxCostUsd?: number;
+            permissions?: Record<string, boolean>;
+            templateId?: string;
+          };
+        } | undefined;
+        if (!params?.agentId) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32602, message: "Missing required param: agentId" },
+          });
+          break;
+        }
+        try {
+          await createIdentity(params.agentId, {
+            soul: params.soul,
+            operatingManual: params.operatingManual,
+            memory: params.memory,
+            patterns: params.patterns,
+          }, params.config);
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            result: { created: true, agentId: params.agentId },
+          });
+        } catch (err) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32000, message: err instanceof Error ? err.message : String(err) },
+          });
+        }
+        break;
+      }
+
+      case "agent/identity/update": {
+        const params = request.params as {
+          agentId: string;
+          file: string;
+          content: string;
+        } | undefined;
+        if (!params?.agentId || !params?.file || params?.content === undefined) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32602, message: "Missing required params: agentId, file, content" },
+          });
+          break;
+        }
+        try {
+          updateIdentityFile(
+            params.agentId,
+            params.file as "soul.md" | "operating-manual.md" | "memory.md" | "lessons.md" | "patterns.md",
+            params.content,
+          );
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            result: { updated: true },
+          });
+        } catch (err) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32000, message: err instanceof Error ? err.message : String(err) },
+          });
+        }
+        break;
+      }
+
+      case "agent/identity/delete": {
+        const params = request.params as { agentId: string } | undefined;
+        if (!params?.agentId) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32602, message: "Missing required param: agentId" },
+          });
+          break;
+        }
+        const deleted = deleteIdentity(params.agentId);
+        writeLine(process.stdout, {
+          jsonrpc: "2.0", id: request.id,
+          result: { deleted },
+        });
+        break;
+      }
+
+      case "agent/identity/append-lesson": {
+        const params = request.params as {
+          agentId: string;
+          what: string;
+          why: string;
+          fix: string;
+          neverCompress?: boolean;
+        } | undefined;
+        if (!params?.agentId || !params?.what || !params?.fix) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32602, message: "Missing required params: agentId, what, fix" },
+          });
+          break;
+        }
+        try {
+          appendLesson(params.agentId, {
+            what: params.what,
+            why: params.why ?? "",
+            fix: params.fix,
+            neverCompress: params.neverCompress,
+          });
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            result: { appended: true },
+          });
+        } catch (err) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32000, message: err instanceof Error ? err.message : String(err) },
+          });
+        }
+        break;
+      }
+
+      case "agent/identity/append-log": {
+        const params = request.params as { agentId: string; content: string } | undefined;
+        if (!params?.agentId || !params?.content) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32602, message: "Missing required params: agentId, content" },
+          });
+          break;
+        }
+        try {
+          appendDailyLog(params.agentId, params.content);
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            result: { appended: true },
+          });
+        } catch (err) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32000, message: err instanceof Error ? err.message : String(err) },
+          });
+        }
+        break;
+      }
+
+      // ── Identity index: search, index, rebuild ──────────────────────────
+      case "agent/identity/search": {
+        const params = request.params as { query: string; agentIds?: string[]; fileTypes?: string[]; limit?: number; semantic?: boolean } | undefined;
+        if (!params?.query) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32602, message: "Missing required param: query" },
+          });
+          break;
+        }
+        try {
+          const results = await searchIdentities(params.query, {
+            agentIds: params.agentIds,
+            fileTypes: params.fileTypes as any,
+            limit: params.limit,
+            semantic: params.semantic,
+          });
+          writeLine(process.stdout, { jsonrpc: "2.0", id: request.id, result: results });
+        } catch (err) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32000, message: err instanceof Error ? err.message : String(err) },
+          });
+        }
+        break;
+      }
+
+      case "agent/identity/index": {
+        const params = request.params as { agentId: string; embeddings?: boolean } | undefined;
+        if (!params?.agentId) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32602, message: "Missing required param: agentId" },
+          });
+          break;
+        }
+        try {
+          const result = await indexAgent(params.agentId, { embeddings: params.embeddings });
+          writeLine(process.stdout, { jsonrpc: "2.0", id: request.id, result });
+        } catch (err) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32000, message: err instanceof Error ? err.message : String(err) },
+          });
+        }
+        break;
+      }
+
+      case "agent/identity/rebuild-index": {
+        const params = request.params as { embeddings?: boolean } | undefined;
+        try {
+          const result = await rebuildIndex({ embeddings: params?.embeddings });
+          writeLine(process.stdout, { jsonrpc: "2.0", id: request.id, result });
+        } catch (err) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32000, message: err instanceof Error ? err.message : String(err) },
+          });
+        }
+        break;
+      }
+
+      // ── Agent config (config.json) ──────────────────────────────────────
+      case "agent/config/get": {
+        const params = request.params as { agentId: string } | undefined;
+        if (!params?.agentId) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32602, message: "Missing required param: agentId" },
+          });
+          break;
+        }
+        try {
+          const { loadAgentConfig } = await import("./agent-config.js");
+          const config = loadAgentConfig(params.agentId);
+          writeLine(process.stdout, { jsonrpc: "2.0", id: request.id, result: config });
+        } catch (err) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32000, message: err instanceof Error ? err.message : String(err) },
+          });
+        }
+        break;
+      }
+
+      case "agent/config/update": {
+        const params = request.params as { agentId: string; config: Record<string, unknown> } | undefined;
+        if (!params?.agentId || !params?.config) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32602, message: "Missing required params: agentId, config" },
+          });
+          break;
+        }
+        try {
+          const { saveAgentConfig } = await import("./agent-config.js");
+          saveAgentConfig(params.agentId, params.config as any);
+          const { loadAgentConfig } = await import("./agent-config.js");
+          const updated = loadAgentConfig(params.agentId);
+          writeLine(process.stdout, { jsonrpc: "2.0", id: request.id, result: updated });
+        } catch (err) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32000, message: err instanceof Error ? err.message : String(err) },
+          });
+        }
+        break;
+      }
+
+      case "agent/config/reports": {
+        const params = request.params as { agentId: string } | undefined;
+        if (!params?.agentId) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32602, message: "Missing required param: agentId" },
+          });
+          break;
+        }
+        try {
+          const { getDirectReports, getChainOfCommand } = await import("./agent-config.js");
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            result: {
+              directReports: getDirectReports(params.agentId),
+              chainOfCommand: getChainOfCommand(params.agentId),
+            },
+          });
+        } catch (err) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32000, message: err instanceof Error ? err.message : String(err) },
+          });
+        }
+        break;
+      }
+
+      // ── Agent templates ─────────────────────────────────────────────────
+      case "agent/templates/list": {
+        const params = request.params as { category?: string } | undefined;
+        try {
+          const { listTemplates } = await import("./agent-templates.js");
+          const templates = listTemplates(params?.category as any);
+          writeLine(process.stdout, { jsonrpc: "2.0", id: request.id, result: templates });
+        } catch (err) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32000, message: err instanceof Error ? err.message : String(err) },
+          });
+        }
+        break;
+      }
+
+      case "agent/templates/get": {
+        const params = request.params as { templateId: string } | undefined;
+        if (!params?.templateId) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32602, message: "Missing required param: templateId" },
+          });
+          break;
+        }
+        try {
+          const { getTemplate } = await import("./agent-templates.js");
+          const template = getTemplate(params.templateId);
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            result: template ?? null,
+          });
+        } catch (err) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32000, message: err instanceof Error ? err.message : String(err) },
+          });
+        }
+        break;
+      }
+
+      case "agent/templates/categories": {
+        try {
+          const { getTemplateCategories } = await import("./agent-templates.js");
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            result: getTemplateCategories(),
+          });
+        } catch (err) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32000, message: err instanceof Error ? err.message : String(err) },
+          });
+        }
+        break;
+      }
+
+      // ── Channel operations ───────────────────────────────────────────────
+      case "channel/list": {
+        try {
+          const result = await listChannels();
+          writeLine(process.stdout, { jsonrpc: "2.0", id: request.id, result });
+        } catch (err) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32000, message: err instanceof Error ? err.message : String(err) },
+          });
+        }
+        break;
+      }
+
+      case "channel/create": {
+        const params = request.params as { name: string; description?: string; members?: string[] } | undefined;
+        if (!params?.name) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32602, message: "Missing required param: name" },
+          });
+          break;
+        }
+        try {
+          const result = await createChannel(params.name, params.description, params.members);
+          writeLine(process.stdout, { jsonrpc: "2.0", id: request.id, result });
+        } catch (err) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32000, message: err instanceof Error ? err.message : String(err) },
+          });
+        }
+        break;
+      }
+
+      case "channel/get": {
+        const params = request.params as { channelId?: string; name?: string } | undefined;
+        try {
+          const result = params?.channelId
+            ? await getChannel(params.channelId)
+            : params?.name
+            ? await getChannelByName(params.name)
+            : null;
+          writeLine(process.stdout, { jsonrpc: "2.0", id: request.id, result });
+        } catch (err) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32000, message: err instanceof Error ? err.message : String(err) },
+          });
+        }
+        break;
+      }
+
+      case "channel/update": {
+        const params = request.params as { channelId: string; name?: string; description?: string } | undefined;
+        if (!params?.channelId) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32602, message: "Missing required param: channelId" },
+          });
+          break;
+        }
+        try {
+          const result = await updateChannel(params.channelId, { name: params.name, description: params.description });
+          writeLine(process.stdout, { jsonrpc: "2.0", id: request.id, result: { updated: result } });
+        } catch (err) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32000, message: err instanceof Error ? err.message : String(err) },
+          });
+        }
+        break;
+      }
+
+      case "channel/delete": {
+        const params = request.params as { channelId: string } | undefined;
+        if (!params?.channelId) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32602, message: "Missing required param: channelId" },
+          });
+          break;
+        }
+        try {
+          const result = await deleteChannel(params.channelId);
+          writeLine(process.stdout, { jsonrpc: "2.0", id: request.id, result: { deleted: result } });
+        } catch (err) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32000, message: err instanceof Error ? err.message : String(err) },
+          });
+        }
+        break;
+      }
+
+      case "channel/members": {
+        const params = request.params as { channelId: string; action?: "list" | "add" | "remove"; memberId?: string } | undefined;
+        if (!params?.channelId) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32602, message: "Missing required param: channelId" },
+          });
+          break;
+        }
+        try {
+          if (params.action === "add" && params.memberId) {
+            await addMember(params.channelId, params.memberId);
+            writeLine(process.stdout, { jsonrpc: "2.0", id: request.id, result: { added: true } });
+          } else if (params.action === "remove" && params.memberId) {
+            await removeMember(params.channelId, params.memberId);
+            writeLine(process.stdout, { jsonrpc: "2.0", id: request.id, result: { removed: true } });
+          } else {
+            const members = await listMembers(params.channelId);
+            writeLine(process.stdout, { jsonrpc: "2.0", id: request.id, result: members });
+          }
+        } catch (err) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32000, message: err instanceof Error ? err.message : String(err) },
+          });
+        }
+        break;
+      }
+
+      case "channel/post": {
+        const params = request.params as { channelId: string; authorId: string; content: string; threadId?: string; metadata?: Record<string, unknown> } | undefined;
+        if (!params?.channelId || !params?.authorId || !params?.content) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32602, message: "Missing required params: channelId, authorId, content" },
+          });
+          break;
+        }
+        try {
+          const msg = await postMessage(params.channelId, params.authorId, params.content, {
+            threadId: params.threadId,
+            metadata: params.metadata,
+          });
+          // Route @mentions (non-blocking — don't await, fire and forget)
+          routeMessage(msg).catch((err) => {
+            process.stderr.write(`[subprocess] mention routing failed: ${err instanceof Error ? err.message : String(err)}\n`);
+          });
+          writeLine(process.stdout, { jsonrpc: "2.0", id: request.id, result: msg });
+        } catch (err) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32000, message: err instanceof Error ? err.message : String(err) },
+          });
+        }
+        break;
+      }
+
+      case "channel/messages": {
+        const params = request.params as { channelId: string; limit?: number; before?: string; threadId?: string } | undefined;
+        if (!params?.channelId) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32602, message: "Missing required param: channelId" },
+          });
+          break;
+        }
+        try {
+          const messages = await getMessages(params.channelId, {
+            limit: params.limit,
+            before: params.before,
+            threadId: params.threadId,
+          });
+          writeLine(process.stdout, { jsonrpc: "2.0", id: request.id, result: messages });
+        } catch (err) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32000, message: err instanceof Error ? err.message : String(err) },
+          });
+        }
+        break;
+      }
+
+      case "channel/search": {
+        const params = request.params as { query: string; channelId?: string; authorId?: string; limit?: number } | undefined;
+        if (!params?.query) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32602, message: "Missing required param: query" },
+          });
+          break;
+        }
+        try {
+          const results = await searchMessages(params.query, {
+            channelId: params.channelId,
+            authorId: params.authorId,
+            limit: params.limit,
+          });
+          writeLine(process.stdout, { jsonrpc: "2.0", id: request.id, result: results });
+        } catch (err) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32000, message: err instanceof Error ? err.message : String(err) },
+          });
+        }
+        break;
+      }
+
+      // ── Schedule operations ──────────────────────────────────────────────
+      case "schedule/list": {
+        const params = request.params as { ownerType?: "agent" | "user"; ownerId?: string; enabledOnly?: boolean } | undefined;
+        try {
+          const result = await listSchedules(params);
+          writeLine(process.stdout, { jsonrpc: "2.0", id: request.id, result });
+        } catch (err) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32000, message: err instanceof Error ? err.message : String(err) },
+          });
+        }
+        break;
+      }
+
+      case "schedule/create": {
+        const params = request.params as {
+          ownerType: "agent" | "user"; ownerId: string; channelId: string;
+          cron: string; prompt: string; model?: string; source?: "manual" | "operating-manual" | "agent-created";
+        } | undefined;
+        if (!params?.ownerType || !params?.ownerId || !params?.channelId || !params?.cron || !params?.prompt) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32602, message: "Missing required params: ownerType, ownerId, channelId, cron, prompt" },
+          });
+          break;
+        }
+        try {
+          const schedule = await createSchedule(params);
+          // Auto-register with Croner if scheduler is running
+          if (isRunning()) registerJob(schedule);
+          writeLine(process.stdout, { jsonrpc: "2.0", id: request.id, result: schedule });
+        } catch (err) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32000, message: err instanceof Error ? err.message : String(err) },
+          });
+        }
+        break;
+      }
+
+      case "schedule/update": {
+        const params = request.params as { id: string; cron?: string; prompt?: string; channelId?: string; model?: string | null; enabled?: boolean } | undefined;
+        if (!params?.id) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32602, message: "Missing required param: id" },
+          });
+          break;
+        }
+        try {
+          const updated = await updateSchedule(params.id, params);
+          // Re-register job if cron changed or enabled/disabled
+          if (isRunning()) {
+            const schedule = await getSchedule(params.id);
+            if (schedule?.enabled) {
+              registerJob(schedule);
+            } else {
+              unregisterJob(params.id);
+            }
+          }
+          writeLine(process.stdout, { jsonrpc: "2.0", id: request.id, result: { updated } });
+        } catch (err) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32000, message: err instanceof Error ? err.message : String(err) },
+          });
+        }
+        break;
+      }
+
+      case "schedule/delete": {
+        const params = request.params as { id: string } | undefined;
+        if (!params?.id) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32602, message: "Missing required param: id" },
+          });
+          break;
+        }
+        try {
+          unregisterJob(params.id);
+          const deleted = await deleteSchedule(params.id);
+          writeLine(process.stdout, { jsonrpc: "2.0", id: request.id, result: { deleted } });
+        } catch (err) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32000, message: err instanceof Error ? err.message : String(err) },
+          });
+        }
+        break;
+      }
+
+      case "schedule/pause": {
+        const params = request.params as { id: string } | undefined;
+        if (!params?.id) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32602, message: "Missing required param: id" },
+          });
+          break;
+        }
+        try {
+          await updateSchedule(params.id, { enabled: false });
+          unregisterJob(params.id);
+          writeLine(process.stdout, { jsonrpc: "2.0", id: request.id, result: { paused: true } });
+        } catch (err) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32000, message: err instanceof Error ? err.message : String(err) },
+          });
+        }
+        break;
+      }
+
+      case "schedule/resume": {
+        const params = request.params as { id: string } | undefined;
+        if (!params?.id) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32602, message: "Missing required param: id" },
+          });
+          break;
+        }
+        try {
+          await updateSchedule(params.id, { enabled: true });
+          const schedule = await getSchedule(params.id);
+          if (schedule) registerJob(schedule);
+          writeLine(process.stdout, { jsonrpc: "2.0", id: request.id, result: { resumed: true } });
+        } catch (err) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32000, message: err instanceof Error ? err.message : String(err) },
+          });
+        }
+        break;
+      }
+
+      case "schedule/history": {
+        const params = request.params as { scheduleId: string; limit?: number } | undefined;
+        if (!params?.scheduleId) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32602, message: "Missing required param: scheduleId" },
+          });
+          break;
+        }
+        try {
+          const history = await getRunHistory(params.scheduleId, { limit: params.limit });
+          writeLine(process.stdout, { jsonrpc: "2.0", id: request.id, result: history });
+        } catch (err) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32000, message: err instanceof Error ? err.message : String(err) },
+          });
+        }
+        break;
+      }
+
+      case "schedule/start": {
+        try {
+          const result = await loadAndStartAll();
+          writeLine(process.stdout, { jsonrpc: "2.0", id: request.id, result });
+        } catch (err) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32000, message: err instanceof Error ? err.message : String(err) },
+          });
+        }
+        break;
+      }
+
+      case "schedule/stop": {
+        try {
+          stopAll();
+          writeLine(process.stdout, { jsonrpc: "2.0", id: request.id, result: { stopped: true } });
+        } catch (err) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32000, message: err instanceof Error ? err.message : String(err) },
+          });
+        }
+        break;
+      }
+
+      case "schedule/status": {
+        writeLine(process.stdout, {
+          jsonrpc: "2.0", id: request.id,
+          result: { running: isRunning(), activeJobs: activeJobCount() },
+        });
         break;
       }
 

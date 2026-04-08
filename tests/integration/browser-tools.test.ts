@@ -31,6 +31,14 @@ const mockPage = {
   },
   evaluate: vi.fn().mockResolvedValue("script result"),
   close: vi.fn().mockResolvedValue(undefined),
+  on: vi.fn(),
+  setViewportSize: vi.fn().mockResolvedValue(undefined),
+  emulateMedia: vi.fn().mockResolvedValue(undefined),
+  viewportSize: vi.fn().mockReturnValue({ width: 1280, height: 720 }),
+  selectOption: vi.fn().mockResolvedValue([]),
+  check: vi.fn().mockResolvedValue(undefined),
+  uncheck: vi.fn().mockResolvedValue(undefined),
+  accessibility: { snapshot: vi.fn().mockResolvedValue({ role: "WebArea", name: "", children: [] }) },
 };
 
 const mockContext = {
@@ -85,6 +93,14 @@ function resetMocks() {
   mockPage.mouse.wheel.mockClear();
   mockPage.evaluate.mockClear();
   mockPage.close.mockClear();
+  mockPage.on.mockClear();
+  mockPage.setViewportSize.mockClear();
+  mockPage.emulateMedia.mockClear();
+  mockPage.viewportSize.mockClear();
+  mockPage.selectOption.mockClear();
+  mockPage.check.mockClear();
+  mockPage.uncheck.mockClear();
+  mockPage.accessibility.snapshot.mockClear();
   mockContext.newPage.mockClear();
   mockBrowser.newContext.mockClear();
   mockBrowser.close.mockClear();

@@ -20,6 +20,14 @@
  *   browser_scroll     — Scroll the page
  *   browser_execute    — Run JavaScript in the page context
  *   browser_close      — Close the browser session
+ *
+ * Dev-workflow tools (in browser-dev.ts) extend this with:
+ *   browser_console_logs — Captured console messages
+ *   browser_network      — Captured network requests/responses
+ *   browser_inspect      — DOM element CSS/style inspection
+ *   browser_snapshot     — Accessibility tree snapshot
+ *   browser_resize       — Viewport size and color scheme
+ *   browser_fill         — Smart form fill (select/checkbox/radio/text)
  */
 
 import type { ToolExecuteOptions, ToolExecutor, ToolResult } from "../types.js";
@@ -28,7 +36,7 @@ import type { ToolExecuteOptions, ToolExecutor, ToolResult } from "../types.js";
 // We use a structural interface (not the full Playwright types) because
 // playwright is an optional runtime dependency — not present at compile time.
 
-interface PPage {
+export interface PPage {
   goto(url: string, opts?: Record<string, unknown>): Promise<{ title(): Promise<string> } | void>;
   title(): Promise<string>;
   url(): string;
@@ -45,27 +53,81 @@ interface PPage {
     wheel(deltaX: number, deltaY: number): Promise<void>;
   };
   evaluate<T = unknown>(script: string): Promise<T>;
+  on(event: string, handler: (...args: unknown[]) => void): void;
+  setViewportSize(size: { width: number; height: number }): Promise<void>;
+  emulateMedia(opts: Record<string, unknown>): Promise<void>;
+  viewportSize(): { width: number; height: number } | null;
+  selectOption(selector: string, value: string | string[]): Promise<string[]>;
+  check(selector: string): Promise<void>;
+  uncheck(selector: string): Promise<void>;
+  accessibility: { snapshot(opts?: Record<string, unknown>): Promise<unknown> };
 }
 
-interface PContext {
+export interface PContext {
   newPage(): Promise<PPage>;
 }
 
-interface PBrowser {
+export interface PBrowser {
   newContext(opts: Record<string, unknown>): Promise<PContext>;
   close(): Promise<void>;
 }
 
-// ── Session pool ───────────────────────────────────────────────────────────────
+// ── Console & network event buffers ──────────────────────────────────────────
 
-interface BrowserState {
-  browser: PBrowser;
-  page: PPage;
-  /** Chromium subprocess PID — recorded for kill-based fallback cleanup. */
-  pid?: number;
+export interface ConsoleEntry {
+  level: "log" | "warn" | "error" | "info" | "debug";
+  text: string;
+  timestamp: number;
 }
 
-const _sessions = new Map<string, BrowserState>();
+export interface NetworkEntry {
+  id: string;
+  method: string;
+  url: string;
+  status?: number;
+  contentType?: string;
+  startTime: number;
+  duration?: number;
+  error?: string;
+  /** Stored Playwright Response reference for lazy body retrieval. */
+  _responseRef?: unknown;
+}
+
+const MAX_CONSOLE_ENTRIES = 500;
+const MAX_NETWORK_ENTRIES = 500;
+
+function pushRingBuffer<T>(buf: T[], entry: T, max: number): void {
+  buf.push(entry);
+  if (buf.length > max) buf.splice(0, buf.length - max);
+}
+
+function mapConsoleLevel(type: string): ConsoleEntry["level"] {
+  switch (type) {
+    case "error": return "error";
+    case "warning": return "warn";
+    case "info": return "info";
+    case "debug": return "debug";
+    default: return "log";
+  }
+}
+
+let _networkIdCounter = 0;
+
+// ── Session pool ───────────────────────────────────────────────────────────────
+
+export interface BrowserState {
+  browser: PBrowser;
+  page: PPage;
+  context: PContext;
+  /** Chromium subprocess PID — recorded for kill-based fallback cleanup. */
+  pid?: number;
+  /** Ring buffer of captured console messages. */
+  consoleLogs: ConsoleEntry[];
+  /** Ring buffer of captured network requests/responses. */
+  networkEntries: NetworkEntry[];
+}
+
+export const _sessions = new Map<string, BrowserState>();
 
 // Synchronous fallback — cannot await; see M-12 beforeExit handler for async cleanup.
 // B-08: Also kill browser PIDs directly as a fallback when browser.close() can't be awaited.
@@ -111,7 +173,7 @@ async function getPlaywright(): Promise<{ chromium: { launch(opts: Record<string
   }
 }
 
-async function getSession(sessionId: string): Promise<BrowserState> {
+export async function getSession(sessionId: string): Promise<BrowserState> {
   const existing = _sessions.get(sessionId);
   if (existing) return existing;
 
@@ -127,19 +189,77 @@ async function getSession(sessionId: string): Promise<BrowserState> {
     const proc = (browser as unknown as { process?: () => { pid?: number } }).process?.();
     pid = proc?.pid;
   } catch { /* ok — not all implementations expose .process() */ }
-  const state: BrowserState = { browser, page, pid };
+
+  const consoleLogs: ConsoleEntry[] = [];
+  const networkEntries: NetworkEntry[] = [];
+
+  // Attach console listener — captures log/warn/error/info/debug messages
+  const pageAny = page as unknown as { on: (event: string, handler: (...args: unknown[]) => void) => void };
+  pageAny.on("console", (msg: unknown) => {
+    const m = msg as { type(): string; text(): string };
+    pushRingBuffer(consoleLogs, {
+      level: mapConsoleLevel(m.type()),
+      text: m.text(),
+      timestamp: Date.now(),
+    }, MAX_CONSOLE_ENTRIES);
+  });
+
+  // Attach network request listener
+  pageAny.on("request", (req: unknown) => {
+    const r = req as { method(): string; url(): string };
+    const id = String(++_networkIdCounter);
+    pushRingBuffer(networkEntries, {
+      id,
+      method: r.method(),
+      url: r.url(),
+      startTime: Date.now(),
+    }, MAX_NETWORK_ENTRIES);
+  });
+
+  // Attach network response listener — update matching entry with status/contentType/duration
+  pageAny.on("response", (res: unknown) => {
+    const r = res as { url(): string; status(): number; headers(): Record<string, string>; request(): { method(): string } };
+    const url = r.url();
+    // Find the most recent matching request (iterate backwards)
+    for (let i = networkEntries.length - 1; i >= 0; i--) {
+      const entry = networkEntries[i];
+      if (entry.url === url && entry.status === undefined) {
+        entry.status = r.status();
+        entry.contentType = r.headers()["content-type"] ?? undefined;
+        entry.duration = Date.now() - entry.startTime;
+        entry._responseRef = res;
+        break;
+      }
+    }
+  });
+
+  // Attach request failure listener
+  pageAny.on("requestfailed", (req: unknown) => {
+    const r = req as { url(): string; failure(): { errorText: string } | null };
+    const url = r.url();
+    for (let i = networkEntries.length - 1; i >= 0; i--) {
+      const entry = networkEntries[i];
+      if (entry.url === url && entry.status === undefined && !entry.error) {
+        entry.error = r.failure()?.errorText ?? "Request failed";
+        entry.duration = Date.now() - entry.startTime;
+        break;
+      }
+    }
+  });
+
+  const state: BrowserState = { browser, page, context, pid, consoleLogs, networkEntries };
   _sessions.set(sessionId, state);
   return state;
 }
 
-async function closeSession(sessionId: string): Promise<void> {
+export async function closeSession(sessionId: string): Promise<void> {
   const state = _sessions.get(sessionId);
   if (!state) return;
   _sessions.delete(sessionId);
   try { await state.browser.close(); } catch { /* ok */ }
 }
 
-function sessionKey(opts?: ToolExecuteOptions): string {
+export function sessionKey(opts?: ToolExecuteOptions): string {
   return typeof opts?.sessionId === "string" && opts.sessionId
     ? opts.sessionId
     : "default";
@@ -195,6 +315,7 @@ export const browserNavigateTool: ToolExecutor = {
       await state.page.waitForLoadState("networkidle", { timeout: 5_000 }).catch(() => {/* timeout ok */});
       const title = await state.page.title();
       const finalUrl = state.page.url();
+      opts?.onEmit?.({ type: "browser", action: "navigate", url: finalUrl, sessionId: sessionKey(opts) });
       return { toolCallId: "", content: `Navigated to: ${finalUrl}\nTitle: ${title}`, isError: false };
     } catch (err) {
       return { toolCallId: "", content: `Navigation failed: ${err instanceof Error ? err.message : String(err)}`, isError: true };
@@ -541,6 +662,7 @@ export const browserCloseTool: ToolExecutor = {
       return { toolCallId: "", content: "No browser session is open", isError: false };
     }
     await closeSession(key);
+    opts?.onEmit?.({ type: "browser", action: "close", sessionId: key });
     return { toolCallId: "", content: "Browser session closed", isError: false };
   },
 };

@@ -13,6 +13,8 @@ import { finishTool } from "./finish.js";
 import { notebookReadTool, notebookEditTool } from "./notebook.js";
 import { toolAliases } from "./aliases.js";
 import { BROWSER_TOOLS } from "./browser.js";
+import { BROWSER_DEV_TOOLS } from "./browser-dev.js";
+import { DEV_SERVER_TOOLS } from "./dev-server.js";
 import { renderUiTool } from "./render-ui.js";
 import type { ToolExecutor } from "../types.js";
 
@@ -43,4 +45,4 @@ export function getToolByName(name: string): ToolExecutor | undefined {
 
 export { makeAgentTool, buildAgentsSystemPrompt } from "./agent.js";
 export { resolveUiResponse, renderUiTool } from "./render-ui.js";
-export { bashTool, readFileTool, writeFileTool, strReplaceTool, editFileTool, editFilesTool, listDirTool, globTool, grepTool, webFetchTool, webSearchTool, deleteFileTool, moveFileTool, createDirTool, finishTool, notebookReadTool, notebookEditTool, toolAliases, BROWSER_TOOLS };
+export { bashTool, readFileTool, writeFileTool, strReplaceTool, editFileTool, editFilesTool, listDirTool, globTool, grepTool, webFetchTool, webSearchTool, deleteFileTool, moveFileTool, createDirTool, finishTool, notebookReadTool, notebookEditTool, toolAliases, BROWSER_TOOLS, BROWSER_DEV_TOOLS, DEV_SERVER_TOOLS };

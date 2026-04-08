@@ -10,6 +10,8 @@ on:
     - cron: "0 6 * * *"
   workflow_dispatch:
 
+# Skip smoke tests for Dependabot PRs — CI covers type/test checks already
+
 permissions:
   contents: read
 
@@ -17,6 +19,7 @@ jobs:
   smoke:
     name: E2E smoke tests (free model)
     runs-on: ubuntu-latest
+    if: github.actor != 'dependabot[bot]'
 
     # Environment protection: requires manual approval for PRs from
     # non-collaborators. Secrets (OPENROUTER_API_KEY) are only available
@@ -88,8 +91,8 @@ jobs:
   tournament:
     name: Prompt tournament (free model)
     runs-on: ubuntu-latest
-    # Only run on push to main and nightly — not on every PR (slow / costly)
-    if: github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # Only run on nightly schedule or manual dispatch — not on every push to main
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
 
     environment: integration
 

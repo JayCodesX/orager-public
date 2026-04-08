@@ -41,52 +41,96 @@ The workflow we're modeling: https://youtu.be/MsewgFiY7F4?si=zA5hnHJvoDOuw-xP
 
 ### Existing App Structure (what you're redesigning)
 
-The app currently has a **tab-based layout** with a sessions sidebar:
+> **Note to designer:** Run orager-desktop locally before mocking to confirm the actual layout — screenshots can go stale as the app evolves.
 
+The app currently has a **chat-first layout** with a persistent sessions sidebar:
+
+**Chat View:**
 ```
-┌──────────────────────────────────────────────────────────┐
-│  [Title Bar]                                              │
-├────────┬─────────────────────────────────────────────────┤
-│        │                                                  │
-│  Tabs  │  Content Area                                    │
-│  ────  │                                                  │
-│  Chat  │  (varies by tab)                                 │
-│  Skills│                                                  │
-│  Memory│                                                  │
-│  Costs │                                                  │
-│  Logs  │                                                  │
-│  OMLS  │                                                  │
-│  ...   │                                                  │
-│        │                                                  │
-├────────┴─────────────────────────────────────────────────┤
-│  [Status Bar]                                             │
-└──────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  OragerAI          [< Back]  [Model Selector ▾]    📁 User   │
+├──────────┬───────────────────────────────────────────────────┤
+│ 🔍 Search │                                                   │
+│ sessions  │                                                   │
+│           │              Chat Messages                        │
+│ TODAY     │        (right-aligned user bubbles                │
+│ ─────     │         with timestamps)                          │
+│ Session 1 │                                                   │
+│ Session 2 │                                                   │
+│           │                                                   │
+│           │                                                   │
+│           │                                                   │
+│           ├───────────────────────────────────────────────────┤
+│           │  📎  [Message OragerAI...]              [Send ➤]  │
+├──────────┴───────────────────────────────────────────────────┤
+│  🟢 Connected    Pro   v0.1.0                                 │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-### Existing Tabs/Pages
+**Key layout details:**
+- **Sessions sidebar (left):** Persistent across all views. Shows searchable session list grouped by date (e.g., "TODAY"). Each session is a row. A `[+]` button creates new sessions.
+- **Top bar:** Back arrow (`<`), model selector dropdown (e.g., "Qwen: Qwen3 Next 80B A3B Instruct (free)"), and a user folder path display on the right.
+- **Chat area (center):** User messages appear as right-aligned bubbles with timestamps. Agent responses stream below. No left-aligned agent avatars currently.
+- **Message input (bottom):** Attachment icon (📎) on the left, text input placeholder ("Message OragerAI... (Shift+Enter for newline, drag files here)"), send button on the right.
+- **Status bar (bottom-left):** Green dot + "Connected", "Pro" badge, version number (v0.1.0).
 
-| Tab | What it does | Keep / Rethink |
+**Settings View:**
+```
+┌──────────────────────────────────────────────────────────────┐
+│                          Settings                             │
+├──────────┬────────────┬──────────────────────────────────────┤
+│ 🔍 Search │            │                                      │
+│ sessions  │  Overview  │  SESSIONS  TOTAL COST  TODAY  AVG    │
+│           │  Costs     │  2         $0.0000     $0.00  --     │
+│ TODAY     │  API Keys  │                                      │
+│ ─────     │  OpenRouter│  ACTIVITY                            │
+│ Session 1 │  Advanced  │  No events yet                       │
+│ Session 2 │  Permissions│                                     │
+│           │  Skills    │                                      │
+│           │  Logs      │                                      │
+│           │            │                                      │
+├──────────┴────────────┴──────────────────────────────────────┤
+│  🟢 Connected    Pro   v0.1.0                                 │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**Key layout details (Settings):**
+- **Sessions sidebar (left):** Same persistent sidebar as the chat view.
+- **Settings nav (middle column):** Vertical list of settings categories: Overview, Costs, API Keys, OpenRouter, Advanced, Permissions, Skills, Logs. "Overview" is selected by default.
+- **Settings content (right):** Displays the selected settings page. Overview shows stats cards (Sessions count, Total Cost, Today's cost, Avg Turns) and an Activity feed.
+- The settings view does **not** use the top bar model selector — instead it shows a centered "Settings" title.
+
+**What this means:** The current app is **not** tab-based with feature tabs (Chat, Skills, Memory, etc.) in the left sidebar. Instead, it uses a **sessions-first sidebar** with the chat as the primary surface. Features like Skills, Costs, and Logs are accessed through the **Settings view's secondary navigation**, not as top-level tabs.
+
+### Existing Views/Pages
+
+The app has two primary views — **Chat** and **Settings** — not a tab bar with many feature tabs.
+
+| View / Page | What it does | Keep / Rethink |
 |---|---|---|
-| **SessionChat** | 1:1 chat with a single agent. Message input, streaming responses, tool call display. This is the primary UI today. | **Rethink** — becomes one surface inside a larger agent workspace |
-| **SkillBank** | Lists learned skills, delete/inspect. Bare table. | **Rethink** — add Toolkits import, per-agent skill view |
-| **MemoryBrowser** | Browse memory namespaces and entries | **Rethink** — integrate with per-agent memory/lessons/patterns |
-| **CostTracker** | Charts showing token usage and costs over time | **Keep** — move into a dashboard or agent profile |
-| **LogViewer** | Raw system logs | **Keep** — move to developer/debug area |
-| **ModelCompare** | Side-by-side model comparison | **Keep** — low priority, can stay as-is |
-| **OmlsStatus** | OMLS training status (Pro feature) | **Keep** — move to agent profile or settings |
-| **Profiles** | 8 built-in profile presets | **Rethink** — profiles become a starting point for agent creation |
-| **Settings** | Config editor | **Rethink** — add Toolkits, Agent Management, License sections |
-| **OllamaManager** | Manage local Ollama models | **Keep** — move to settings |
-| **Dashboard** | Overview (minimal currently) | **Rethink** — becomes the home screen |
+| **Chat View** (primary) | 1:1 chat with a single agent. Sessions sidebar on the left, model selector in top bar, message input at bottom. This is the default and primary UI. | **Rethink** — becomes one surface inside a larger agent workspace |
+| **Settings > Overview** | Dashboard showing session count, total cost, today's cost, avg turns, and an activity feed ("No events yet" when empty). | **Rethink** — becomes the home screen / dashboard |
+| **Settings > Costs** | Cost tracking for token usage | **Keep** — move into a dashboard or agent profile |
+| **Settings > API Keys** | API key configuration | **Keep** — stays in settings |
+| **Settings > OpenRouter** | OpenRouter provider configuration | **Keep** — stays in settings |
+| **Settings > Advanced** | Advanced configuration options | **Keep** — stays in settings |
+| **Settings > Permissions** | Tool permission settings | **Rethink** — integrate with per-agent capabilities |
+| **Settings > Skills** | Skills management | **Rethink** — add Toolkits import, per-agent skill view, promote to top-level nav |
+| **Settings > Logs** | System logs | **Keep** — move to developer/debug area |
+
+**Note:** Features like MemoryBrowser, ModelCompare, OmlsStatus, OllamaManager, and Profiles described in earlier specs are **not currently visible in the app's UI** as top-level tabs. They may exist as code components but are not surfaced in the current navigation. The designer should run the app to confirm which of these are accessible and how.
 
 ### Existing Components
 
-- `SessionsSidebar.tsx` — left sidebar listing chat sessions
+- `SessionsSidebar.tsx` — left sidebar listing chat sessions with search and date grouping (persistent across views)
 - `CommandPalette.tsx` — Cmd+K command launcher
-- `ModelSelect.tsx` — model dropdown
+- `ModelSelect.tsx` — model dropdown in the top bar (shows provider + model name + tier badge)
 - `LicenseGate.tsx` — blocks Pro features for free tier
 - `OnboardingBanner.tsx` — first-run setup prompt
-- `TitleBar.tsx`, `Toast.tsx`, `Tooltip.tsx`, `ConfirmDialog.tsx`
+- `TitleBar.tsx` — top bar with back navigation, model selector, and user folder path
+- `StatusBar.tsx` — bottom bar with connection status dot, Pro badge, and version number
+- `Settings` pages — secondary nav with Overview, Costs, API Keys, OpenRouter, Advanced, Permissions, Skills, Logs
+- `Toast.tsx`, `Tooltip.tsx`, `ConfirmDialog.tsx`
 
 ### Tech Stack (fixed, not changing)
 
@@ -485,12 +529,14 @@ Settings → Toolkits → Enter "rohitg00/awesome-claude-code-toolkit" → Brows
 
 | Component | Current | Redesign Notes |
 |---|---|---|
-| `SessionChat` | Full-page 1:1 chat | Becomes the Direct Line channel view — same chat UX but inside the channel frame |
-| `SessionsSidebar` | List of past sessions | Evolves into `ChannelSidebar` — channels replace sessions as the primary nav |
-| `SkillBank` | Bare table | Add toolkit import section, per-agent filtering, richer skill cards |
-| `MemoryBrowser` | Namespace browser | Integrate into Agent Profile > Memory tab. Global view stays but secondary |
-| `Dashboard` | Minimal | Full home screen with activity feed, agent grid, stats, alerts |
-| `Settings` | Config editor | Add Toolkits, License, Agents tabs |
+| **Chat View** | Chat-first layout: sessions sidebar (left) + model selector top bar + right-aligned user message bubbles + message input with attachment button | Becomes the Direct Line channel view — same chat UX but inside the channel frame |
+| `SessionsSidebar` | Persistent left sidebar with session search, date-grouped session list, and `[+]` new session button | Evolves into `ChannelSidebar` — channels replace sessions as the primary nav |
+| `ModelSelect` | Dropdown in top bar showing "Provider: Model Name (tier)" | Keep in channel views; extend for per-agent model assignment |
+| `TitleBar` | Back arrow + model selector + user folder path | Rethink — back arrow becomes channel/view navigation; user folder path may move |
+| `StatusBar` | Connection dot + Pro badge + version | Keep — add agent activity indicators |
+| **Settings** | Secondary nav column (Overview, Costs, API Keys, OpenRouter, Advanced, Permissions, Skills, Logs) with content area | Add Toolkits, License, Agents tabs |
+| **Settings > Overview** | Stats cards (Sessions, Total Cost, Today, Avg Turns) + Activity feed | Evolves into the full Home dashboard with activity feed, agent grid, stats, alerts |
+| **Settings > Skills** | Skills list inside settings | Promote to top-level nav; add toolkit import section, per-agent filtering, richer skill cards |
 | `OnboardingBanner` | Simple banner | Full onboarding flow (API key → model → toolkit → first agent) |
 | `CommandPalette` | Cmd+K | Extend with: switch channel, @mention agent, create agent, search messages |
 
