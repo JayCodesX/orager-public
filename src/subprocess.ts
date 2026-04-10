@@ -633,6 +633,27 @@ export async function startSubprocessServer(): Promise<void> {
         break;
       }
 
+      case "skills/import": {
+        const { importSeedSkill } = await import("./skillbank.js");
+        const params = request.params as { text: string; source?: string } | undefined;
+        if (!params?.text) {
+          writeLine(process.stdout, {
+            jsonrpc: "2.0", id: request.id,
+            error: { code: -32602, message: "Missing required param: text" },
+          });
+          break;
+        }
+        const importResult = await importSeedSkill(
+          params.text,
+          params.source ?? "demo-seed",
+        );
+        writeLine(process.stdout, {
+          jsonrpc: "2.0", id: request.id,
+          result: { status: importResult },
+        });
+        break;
+      }
+
       // ── Memory RPCs ────────────────────────────────────────────────────
       case "memory/list": {
         const { listMemoryKeysSqlite, loadMemoryStoreSqlite } = await import("./memory-sqlite.js");
